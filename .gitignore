@@ -1,15 +1,84 @@
+# ============================================================================
+#  iTechkey NetPulse — Git Ignore
+# ============================================================================
+
+# ---- Python ----
 __pycache__/
 *.py[cod]
-.venv/
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# ---- Virtual environment ----
 venv/
+.venv/
 env/
-*.db
-*.log
-*_secret.key
+ENV/
+env.bak/
+venv.bak/
+
+# ---- Environment & Secrets (NEVER UPLOAD) ----
 .env
+.env.*
+!.env.example
 itechkey_config.json
+itechkey_secret.key
+*.key
+!keys/public_key.pem
+*.pem
+!keys/public_key.pem
+
+# ---- License system (VENDOR SECRETS) ----
+keygen.py
+keys/private_key.pem
+licenses/
+*.lic
+itechkey_license.json
+
+# ---- Build sources (optional — uncomment to keep private) ----
+launcher.cs
+assembly-info.cs
+build-exe.ps1
+build.py
+
+# ---- Database ----
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 *.corrupt
-.DS_Store
-Thumbs.db
-static/itechkey-logo.png
 backups/
+
+# ---- Logs ----
+*.log
+logs/
+itechkey.log
+
+# ---- OS junk ----
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- Reports ----
+*.pdf
+itechkey-report-*.pdf
+!docs/*.pdf
+
+# ---- Keep folder structure ----
+!static/.gitkeep
+!keys/.gitkeep
