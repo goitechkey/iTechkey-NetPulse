@@ -1,6 +1,6 @@
 # iTechkey NetPulse
 
-**Version:** 1.0.0 · **Author:** iTechkey · **Contact:** admin@itechkey.com
+**Version:** 1.0.0 · **Author:** iTechkey · **Contact:** info@itechkey.com
 
 Real-time ping, SNMP, firewall health and L3 port traffic monitoring.
 Built for **1000+ sensors** with MySQL + thread-pool architecture.
