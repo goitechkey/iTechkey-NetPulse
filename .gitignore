@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.db
+*.log
+*_secret.key
+.env
+itechkey_config.json
+*.corrupt
+.DS_Store
+Thumbs.db
+static/itechkey-logo.png
+backups/
