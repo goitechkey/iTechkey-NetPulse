@@ -1359,6 +1359,9 @@ nav .brand img{height:32px;width:auto}
 nav .brand span{font-size:11px;color:#9fb0c4;font-weight:600;letter-spacing:.8px;text-transform:uppercase}
 nav .spacer{flex:1}
 nav .user{font-size:13px;color:#9fb0c4}
+.help-link{display:inline-flex;align-items:center;gap:7px!important;border:1px solid #40516a;border-radius:20px;padding:6px 11px!important;color:#fff!important}
+.help-link:hover,.help-link.active{background:#1d3554;border-color:#78b7ff}
+.help-link .help-icon{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;background:#0a66c2;color:#fff;font-size:13px;font-weight:800}
 .wrap{max-width:1400px;margin:20px auto;padding:0 16px}
 h1,h2{margin:0 0 14px}
 .btn{display:inline-block;padding:8px 14px;border-radius:6px;background:var(--primary);color:#fff;text-decoration:none;font-weight:600;border:none;cursor:pointer;font-size:13px}
@@ -1420,6 +1423,7 @@ footer b{color:var(--primary)}
 <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' }}">Settings</a>
 <span class="spacer"></span>
 <span class="user">👤 {{ session.user }}</span>
+<a href="{{ url_for('help_page') }}" class="help-link {{ 'active' if active=='help' }}" aria-label="Open NetPulse Help Center" title="Help & user guide"><span class="help-icon" aria-hidden="true">?</span><span>Help</span></a>
 <a href="{{ url_for('logout') }}">Logout</a>
 </nav>{% endif %}
 <div class="wrap">
@@ -1501,6 +1505,147 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+HELP_HTML = """
+<style>
+.help-hero{padding:28px 30px;border-radius:14px;background:linear-gradient(120deg,#0f1c2e,#174b7b 70%,#0a66c2);color:#fff;margin-bottom:18px;box-shadow:0 8px 24px rgba(15,28,46,.18)}
+.help-hero h1{margin:0 0 8px;font-size:30px}
+.help-hero p{margin:0;color:#d6e7f7;max-width:760px;line-height:1.6}
+.help-hero .help-pill{display:inline-block;margin-top:14px;padding:6px 11px;border-radius:18px;background:rgba(255,255,255,.14);font-size:12px;font-weight:700}
+.help-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:18px;align-items:start}
+.help-toc{position:sticky;top:16px}
+.help-toc a{display:block;padding:8px 10px;margin:2px 0;border-radius:6px;color:#29415c;text-decoration:none;font-size:13px;font-weight:600}
+.help-toc a:hover{background:#eaf2fb;color:#0a66c2}
+.help-section{scroll-margin-top:18px}
+.help-section h2{font-size:20px;margin:0 0 10px;color:#163454}
+.help-section h3{font-size:15px;margin:14px 0 5px}
+.help-section p,.help-section li{font-size:13px;line-height:1.65;color:#425466}
+.help-section p{margin:7px 0}
+.help-section ul,.help-section ol{padding-left:20px;margin:6px 0}
+.help-callout{padding:11px 13px;border-left:4px solid #0a66c2;background:#eef6ff;border-radius:5px;margin:12px 0;color:#29415c;font-size:13px;line-height:1.6}
+.help-callout.warn{border-left-color:#e9a008;background:#fff8e6}
+.help-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.help-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+.help-mini{border:1px solid #e2e8f0;border-radius:8px;padding:12px;background:#fbfdff}
+.help-mini b{display:block;margin-bottom:4px;color:#163454}
+.help-mini span{font-size:12px;color:#5b6b7b;line-height:1.5}
+.help-search{max-width:420px;margin:0 0 16px}
+@media(max-width:760px){.help-layout{grid-template-columns:1fr}.help-toc{position:static;display:flex;overflow:auto;white-space:nowrap}.help-hero{padding:22px}.help-hero h1{font-size:25px}}
+</style>
+<div class="help-hero">
+<h1>NetPulse Help Center</h1>
+<p>Setup guides, feature instructions, and troubleshooting for monitoring your devices, network interfaces, traffic, and storage.</p>
+<span class="help-pill">Signed in as {{ session.user }} · NetPulse v{{ version }}</span>
+</div>
+<input class="help-search" id="helpSearch" type="search" placeholder="Search this guide (e.g. SNMP, disk, alerts)…" aria-label="Search Help Center">
+<div class="help-layout">
+<aside class="card help-toc" aria-label="Help topics">
+<b style="display:block;padding:8px 10px;color:#163454">ON THIS PAGE</b>
+<a href="#start">Quick start</a><a href="#dashboard">Dashboard</a>
+<a href="#devices">Devices & groups</a><a href="#snmp">SNMP credentials</a>
+<a href="#interfaces">WAN & switch ports</a><a href="#storage">Disk usage</a>
+<a href="#sensors">Sensors & history</a><a href="#traffic">Live traffic view</a>
+<a href="#alerts">Alerts & notifications</a><a href="#settings">Settings & security</a>
+<a href="#background">Background running</a><a href="#reports">Reports</a>
+<a href="#troubleshooting">Troubleshooting</a><a href="#limits">Support limits</a>
+</aside>
+<main>
+<section class="card help-section" id="start" data-help>
+<h2>Get started</h2>
+<ol><li>Change the default password in <a href="{{ url_for('settings_page') }}">Settings</a> immediately.</li>
+<li>For network devices, create a read-only SNMP credential from <a href="{{ url_for('snmp_creds_page') }}">Devices → SNMP Credentials</a>.</li>
+<li>Add a device from <a href="{{ url_for('devices') }}">Devices</a>, enter its reachable IP/hostname, role, and (for SNMP monitoring) attach the credential.</li>
+<li>Open that device’s <b>Interfaces</b> page to discover ports, then add Traffic and/or Status sensors.</li>
+<li>Use <a href="{{ url_for('dashboard') }}">Dashboard</a> for status, <a href="{{ url_for('traffic_dashboard') }}">Traffic</a> for interface graphs/cards, and <a href="{{ url_for('alerts_page') }}">Alerts</a> for notifications.</li></ol>
+<div class="help-callout warn"><b>Security:</b> Change the initial admin password before exposing NetPulse to your network. Use a trusted LAN and configure HTTPS with a valid certificate before allowing untrusted access.</div>
+<div class="help-actions"><a class="btn" href="{{ url_for('dashboard') }}">Open Dashboard</a><a class="btn grey" href="{{ url_for('devices') }}">Manage Devices</a><a class="btn green" href="{{ url_for('sensor_new') }}">Add Sensor</a></div>
+</section>
+<section class="card help-section" id="dashboard" data-help>
+<h2>Dashboard</h2><p>The dashboard summarizes sensors by <b>Up</b>, <b>Warning</b>, <b>Down</b>, and <b>Paused</b>. Use the group selector to narrow the view. Select a sensor card to see its history and recent checks. A new device automatically gets a Ping sensor.</p>
+</section>
+<section class="card help-section" id="devices" data-help>
+<h2>Devices & groups</h2><p>Devices represent monitored hosts such as routers, firewalls, switches, servers, and access points. Groups organize devices; tags help identify them. Add or edit devices from <a href="{{ url_for('devices') }}">Devices</a>.</p>
+<p>Enter an address reachable <b>from the NetPulse host</b>. Attach an SNMP credential to enable interface, storage, and supported firewall checks. The app polls configured devices; it does not automatically scan or discover your entire subnet.</p>
+</section>
+<section class="card help-section" id="snmp" data-help>
+<h2>SNMP credentials</h2><p>Create credentials from the Devices page. Use a read-only SNMP community and restrict the device’s SNMP access list to the NetPulse host where practical. The current client supports <b>SNMP v1 and v2c</b> over UDP 161; SNMPv3 is not currently implemented.</p>
+<div class="help-callout">If SNMP discovery times out, verify the device address, SNMP version/community, device-side allow list, UDP 161 firewall path, and that the NetPulse host can route to the management interface.</div>
+</section>
+<section class="card help-section" id="interfaces" data-help>
+<h2>WAN internet & switch-port traffic</h2><p>From <a href="{{ url_for('devices') }}">Devices</a>, select a router/firewall/switch and open <b>Interfaces</b>. Discovery lists SNMP interfaces; select one or more and add traffic and/or status sensors.</p>
+<ul><li>Traffic uses cumulative byte counters and calculates inbound/outbound Mbps between polls. The first successful sample establishes a baseline; rates appear after a subsequent poll.</li>
+<li>Link utilization is calculated only when a link capacity is configured. For a WAN circuit, edit the traffic sensor and set <b>Link capacity (Mbps)</b> to the ISP plan speed if it differs from the reported port speed.</li>
+<li>Use the router/firewall’s actual internet-facing interface for WAN throughput. Traffic on a switch port is that port’s traffic, not automatically whole-internet usage.</li>
+<li>Choose a sensible polling interval; faster polling creates more SNMP requests and stored samples.</li></ul>
+</section>
+<section class="card help-section" id="storage" data-help>
+<h2>Disk and storage usage</h2><p>On a device with SNMP credentials, open <b>Storage</b> to discover fixed logical volumes advertised by HOST-RESOURCES-MIB, select volumes, and set warning/critical used-percentage thresholds. Storage sensors run on the selected interval and appear under Traffic.</p>
+<div class="help-callout warn"><b>Important distinction:</b> Logical volume capacity and availability are not physical-disk SMART, RAID-controller, or predictive-failure health. Those require vendor-specific monitoring or a host agent.</div>
+</section>
+<section class="card help-section" id="sensors" data-help>
+<h2>Sensors & history</h2><p>Create and edit checks in <a href="{{ url_for('sensors_page') }}">Sensors</a>. Available sensor types include Ping, TCP, HTTP, HTTPS, SNMP traffic, SNMP interface status, SNMP storage, and supported firewall health. Each sensor has its own interval, timeout, retry count, thresholds, and enabled state.</p>
+<p>Open a sensor to view recent checks and a historical chart. Traffic history plots inbound and outbound Mbps; storage history plots used percent. Configure warning/error thresholds in the sensor’s units shown by the editor.</p>
+</section>
+<section class="card help-section" id="traffic" data-help>
+<h2>Live Traffic view</h2><p>The <a href="{{ url_for('traffic_dashboard') }}">Traffic</a> page shows SNMP traffic, interface status, firewall health, and storage sensor cards. The browser refreshes displayed readings every 10 seconds; this is a UI refresh, not a guarantee of 10-second polling. Actual collection follows each sensor’s interval.</p>
+</section>
+<section class="card help-section" id="alerts" data-help>
+<h2>Alerts & notification log</h2><p>Create rules on <a href="{{ url_for('alerts_page') }}">Alerts</a>. A rule can apply to one sensor or all sensors and trigger on down, warning, recovery to up, or a latency threshold. Choose email and/or webhook notification and configure a cooldown to reduce repeated alerts.</p>
+<p>Recent notification attempts appear under <a href="{{ url_for('notifications_page') }}">Log</a>. Email requires working SMTP settings. Webhook URLs must be reachable from the NetPulse host.</p>
+</section>
+<section class="card help-section" id="settings" data-help>
+<h2>Settings & security</h2><p><a href="{{ url_for('settings_page') }}">Settings</a> configures SMTP, recipients, and account password. Use the test-email action to check delivery. Treat SMTP passwords, SNMP communities, database credentials, certificate keys, and the local .env file as secrets.</p>
+</section>
+<section class="card help-section" id="background" data-help>
+<h2>Run in the background</h2><p><b>Windows:</b> run <i>iTechkey-Setup.exe as Administrator</i>. The installer registers and starts the scheduled task <b>iTechkey NetPulse Monitor</b>, which runs independently of the installer, VS Code, or terminal and starts at system boot. The machine must be powered on and awake. Check Task Scheduler; logs are <code>itechkey_console.log</code> and <code>itechkey.log</code>.</p>
+<p><b>Direct/manual run:</b> closing the terminal running <code>itechkey_monitor.py</code> stops that process. For production Gunicorn, run exactly one separate <code>itechkey_collector.py</code> process alongside the web server; web workers alone do not poll sensors.</p>
+</section>
+<section class="card help-section" id="reports" data-help>
+<h2>PDF status report</h2><p>Download a snapshot of current sensor statuses and summary from the authenticated report endpoint.</p><div class="help-actions"><a class="btn" href="{{ url_for('report_pdf') }}">Download PDF report</a></div>
+</section>
+<section class="card help-section" id="troubleshooting" data-help>
+<h2>Troubleshooting checklist</h2>
+<div class="help-grid">
+<div class="help-mini"><b>Device shows Down</b><span>Check host/IP, routing, firewall, credentials, and device reachability from the NetPulse machine.</span></div>
+<div class="help-mini"><b>No SNMP interfaces</b><span>Enable SNMP, verify v1/v2c settings and read-only community, allow NetPulse’s IP, and permit UDP 161.</span></div>
+<div class="help-mini"><b>Traffic displays baseline</b><span>Wait until at least a second counter sample; confirm the chosen interface index is still valid.</span></div>
+<div class="help-mini"><b>No storage volumes</b><span>Check whether the host exposes fixed logical volumes through HOST-RESOURCES-MIB; some devices do not.</span></div>
+<div class="help-mini"><b>Email alert not received</b><span>Verify SMTP host/port/security, sender, recipient, credentials, outbound firewall, and use the test-email control.</span></div>
+<div class="help-mini"><b>Web page not opening</b><span>Verify the app/task is running, TCP port 80 is allowed, no other service owns the port, and use the NetPulse host’s LAN IP.</span></div>
+</div>
+<p>For background-mode diagnostics, check the Windows Scheduled Task’s Last Run Result and the two log files above.</p>
+</section>
+<section class="card help-section" id="limits" data-help>
+<h2>Current capabilities & limitations</h2>
+<ul><li>Monitoring requires devices to be configured; there is no automatic whole-subnet discovery or network topology map.</li>
+<li>SNMP support is v1/v2c; vendor-specific CPU, temperature, PoE, RAID, and physical-disk metrics may require model-specific MIB support.</li>
+<li>Storage monitoring reports logical volume utilization/availability, not SMART status.</li>
+<li>HTTPS requires both valid certificate and key paths configured on the server.</li>
+<li>Use a single collector process per database. Multiple collector instances can duplicate polling and alerts.</li></ul>
+<div class="help-actions"><a class="btn grey" href="{{ url_for('dashboard') }}">Return to Dashboard</a></div>
+</section>
+</main>
+</div>
+<script>
+const helpSearch=document.getElementById('helpSearch');
+helpSearch.addEventListener('input',function(){
+    const query=this.value.trim().toLowerCase();
+    document.querySelectorAll('[data-help]').forEach(function(section){
+        section.style.display=!query||section.textContent.toLowerCase().includes(query)?'':'none';
+    });
+});
+</script>
+"""
+
+
+@app.route("/help")
+@login_required
+def help_page():
+        body = render_template_string(
+                HELP_HTML, session=session, version=__app_version__, url_for=url_for,
+        )
+        return render_ctx(body, "Help Center", "help")
 
 
 # ============================================================================

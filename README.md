@@ -27,6 +27,8 @@ python itechkey_monitor.py
 #    Login: admin / admin   ← CHANGE IMMEDIATELY
 ```
 
+After signing in, select **Help** in the navigation bar for a searchable in-app guide to setup, monitoring features, alerts, background operation, and troubleshooting.
+
 The app listens on standard HTTP port **80**. To enable HTTPS on port **443**, set both certificate paths in `.env` before starting the app:
 
 ```env
