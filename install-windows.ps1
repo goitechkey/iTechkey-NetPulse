@@ -5,7 +5,7 @@
 #  Contact : admin@itechkey.com
 # ============================================================================
 #
-#  Usage (PowerShell — Run as Administrator optional):
+#  Usage: run iTechkey-Setup.exe as Administrator.
 #
 #    # Allow script execution for this session only
 #    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
@@ -13,7 +13,7 @@
 #    # Then run:
 #    .\install-windows.ps1
 #
-#  Or double-click:  right-click → Run with PowerShell
+#  Or right-click PowerShell and choose "Run as Administrator".
 # ============================================================================
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +22,7 @@ $ErrorActionPreference = "Stop"
 $VenvDir    = "venv"
 $HttpPort   = 80
 $HttpsPort  = 443
+$TaskName   = "iTechkey NetPulse Monitor"
 
 # ---- Colors ----
 function Write-OK   ($m) { Write-Host "  [OK]   $m" -ForegroundColor Green }
@@ -50,9 +51,19 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -Path $ScriptDir
 Write-Info "Working directory: $ScriptDir"
 
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Err "Administrator privileges are required to bind port 80 and install the background startup task."
+    Write-Info "Run iTechkey-Setup.exe and approve the UAC prompt, or open PowerShell as Administrator."
+    exit 1
+}
+
 # Verify required files exist
 $RequiredFiles = @(
     "itechkey_monitor.py",
+    "itechkey_background.py",
     "itechkey_collector.py",
     "itechkey_snmp.py",
     "itechkey_setup.py",
@@ -192,35 +203,64 @@ if (Test-Path ".env") {
 # ---- Step 5: Firewall rule (optional) ----
 Write-Head "Firewall configuration (optional)"
 
-$isAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if ($isAdmin) {
-    foreach ($port in @($HttpPort, $HttpsPort)) {
-        $ruleName = "iTechkey NetPulse (Port $port)"
-        $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-        if ($existing) {
-            Write-OK "Firewall rule already exists for port $port"
-        } else {
-            try {
-                New-NetFirewallRule -DisplayName $ruleName `
-                    -Direction Inbound -Protocol TCP -LocalPort $port `
-                    -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-                Write-OK "Firewall rule added for port $port"
-            } catch {
-                Write-Warn "Could not add firewall rule for port $port (non-fatal)"
-            }
+foreach ($port in @($HttpPort, $HttpsPort)) {
+    $ruleName = "iTechkey NetPulse (Port $port)"
+    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-OK "Firewall rule already exists for port $port"
+    } else {
+        try {
+            New-NetFirewallRule -DisplayName $ruleName `
+                -Direction Inbound -Protocol TCP -LocalPort $port `
+                -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+            Write-OK "Firewall rule added for port $port"
+        } catch {
+            Write-Warn "Could not add firewall rule for port $port (non-fatal)"
         }
     }
-} else {
-    Write-Info "Not running as Administrator - skipping firewall rule."
-    Write-Info "Other devices on LAN need this. Manual command (Admin PS):"
-    Write-Host ('     New-NetFirewallRule -DisplayName "iTechkey NetPulse HTTP/HTTPS" -Direction Inbound -Protocol TCP -LocalPort {0},{1} -Action Allow' -f $HttpPort, $HttpsPort) -ForegroundColor Gray
 }
 
-# ---- Step 6: Launch app ----
-Write-Head "Starting iTechkey NetPulse"
+# ---- Step 6: Register background task ----
+Write-Head "Installing background startup task"
+
+$backgroundScript = Join-Path $ScriptDir "itechkey_background.py"
+$taskArguments = "-u `"$backgroundScript`""
+$action = New-ScheduledTaskAction -Execute $venvPython `
+    -Argument $taskArguments -WorkingDirectory $ScriptDir
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$taskPrincipal = New-ScheduledTaskPrincipal `
+    -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+    -LogonType S4U -RunLevel Highest
+$taskSettings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew
+
+try {
+    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existingTask -and $existingTask.State -eq "Running") {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        for ($attempt = 0; $attempt -lt 30; $attempt++) {
+            $currentTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if (-not $currentTask -or $currentTask.State -ne "Running") { break }
+            Start-Sleep -Seconds 1
+        }
+    }
+    Register-ScheduledTask -TaskName $TaskName -Action $action `
+        -Trigger $trigger -Principal $taskPrincipal -Settings $taskSettings `
+        -Description "Runs iTechkey NetPulse in the background at system startup." `
+        -Force | Out-Null
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    Write-OK "Background task installed and started. It will start automatically after reboot."
+} catch {
+    Write-Err "Could not install/start the background task: $_"
+    Write-Info "Open Task Scheduler as Administrator and register '$TaskName' manually."
+    exit 1
+}
+
+# ---- Step 7: Installation complete ----
+Write-Head "iTechkey NetPulse is running in the background"
 
 # Get LAN IP
 $lanIP = "localhost"
@@ -250,21 +290,10 @@ Write-Host "admin / admin" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "    IMPORTANT: Change password immediately in Settings!" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "    Press Ctrl+C to stop the monitor." -ForegroundColor Gray
+Write-Host "    Close this installer or VS Code; monitoring will continue." -ForegroundColor Green
+Write-Host "    Task: $TaskName (runs at Windows startup)" -ForegroundColor Gray
+Write-Host "    Console log: $ScriptDir\itechkey_console.log" -ForegroundColor Gray
+Write-Host "    Monitor log: $ScriptDir\itechkey.log" -ForegroundColor Gray
+Write-Host "    Stop: Stop-ScheduledTask -TaskName '$TaskName'" -ForegroundColor Gray
+Write-Host "    Start: Start-ScheduledTask -TaskName '$TaskName'" -ForegroundColor Gray
 Write-Host ""
-
-Start-Sleep -Seconds 2
-
-# Launch in current window
-try {
-    & $venvPython itechkey_monitor.py
-} catch {
-    Write-Host ""
-    Write-Err "Application exited unexpectedly: $_"
-    Read-Host "Press Enter to close"
-    exit 1
-}
-
-Write-Host ""
-Write-OK "Monitor stopped."
-Read-Host "Press Enter to close"

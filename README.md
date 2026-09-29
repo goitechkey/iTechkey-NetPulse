@@ -38,6 +38,12 @@ ITECHKEY_SSL_KEY=/path/to/private-key.pem
 
 Use a valid certificate for your hostname and protect the private key. HTTP requests are redirected to HTTPS when TLS is enabled. Without certificate paths, the app serves HTTP only. Ports 80/443 may require administrator/root privileges and must be allowed through the host/network firewall.
 
+### Windows background operation
+
+Run **iTechkey-Setup.exe as Administrator** (approve the UAC prompt). The Windows installer registers and starts a hidden Task Scheduler task named **iTechkey NetPulse Monitor**. It starts at Windows boot and continues monitoring if the installer window, VS Code, or the terminal is closed. The computer must remain powered on and awake. Check Task Scheduler for task status; application output is written to `itechkey_console.log` and monitor events to `itechkey.log`.
+
+In elevated PowerShell, use `Get-ScheduledTask -TaskName 'iTechkey NetPulse Monitor'` to check it, `Stop-ScheduledTask -TaskName 'iTechkey NetPulse Monitor'` to stop it, or `Start-ScheduledTask -TaskName 'iTechkey NetPulse Monitor'` to start it again. Re-running the installer updates the existing task.
+
 ## Architecture (1000+ sensors)
 
 - **MySQL 8** with InnoDB (or SQLite for small setups)
