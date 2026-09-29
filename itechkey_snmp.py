@@ -108,6 +108,10 @@ def _dec_value(tag: int, content: bytes):
             return content.hex()
     if tag == 0x05:
         return None
+    if tag in (0x80, 0x81, 0x82):
+        # SNMPv2 exception values: noSuchObject, noSuchInstance,
+        # and endOfMibView. Treat all as absent values.
+        return None
     if tag == 0x06:
         return _dec_oid(content)
     if tag == 0x40:
@@ -228,7 +232,7 @@ class SNMPClient:
         rows = 0
         while rows < max_rows:
             new_oid, val = self.getnext(oid)
-            if not new_oid.startswith(prefix) or new_oid == oid:
+            if val is None or not new_oid.startswith(prefix) or new_oid == oid:
                 break
             yield new_oid, val
             oid = new_oid
@@ -298,6 +302,13 @@ IF_OPER_STATUS = {
 }
 
 L3_IF_TYPES = {6, 23, 53, 131, 135, 136, 137, 161}
+HR_STORAGE_MIB = {
+    "storage_type": "1.3.6.1.2.1.25.2.3.1.2",
+    "description": "1.3.6.1.2.1.25.2.3.1.3",
+    "allocation_units": "1.3.6.1.2.1.25.2.3.1.4",
+    "size": "1.3.6.1.2.1.25.2.3.1.5",
+    "used": "1.3.6.1.2.1.25.2.3.1.6",
+}
 
 
 def discover_interfaces(client, l3_only=False):
@@ -334,3 +345,42 @@ def discover_interfaces(client, l3_only=False):
         out.append(info)
     out.sort(key=lambda x: int(x.get("if_index", "0")))
     return out
+
+
+def discover_storage(client):
+    """Discover logical storage rows exposed by HOST-RESOURCES-MIB."""
+    storage = {}
+    for key, base_oid in HR_STORAGE_MIB.items():
+        try:
+            for oid, value in client.bulkwalk(base_oid, max_rows=5000):
+                index = oid.rsplit(".", 1)[-1]
+                storage.setdefault(index, {"storage_index": index})[key] = value
+        except SNMPError:
+            continue
+
+    result = []
+    for index, row in storage.items():
+        if row.get("storage_type") and row["storage_type"] != "1.3.6.1.2.1.25.2.1.4":
+            continue
+        try:
+            units = int(row.get("allocation_units") or 0)
+            size = int(row.get("size") or 0)
+            used = int(row.get("used") or 0)
+        except (TypeError, ValueError):
+            continue
+        if units <= 0 or size <= 0:
+            continue
+        total_bytes = units * size
+        used_bytes = units * used
+        result.append({
+            "storage_index": index,
+            "description": str(row.get("description") or "Storage " + index),
+            "allocation_units": units,
+            "size_units": size,
+            "used_units": used,
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+            "used_percent": round(used_bytes * 100 / total_bytes, 2),
+        })
+    result.sort(key=lambda row: int(row["storage_index"]))
+    return result

@@ -272,13 +272,15 @@ def summary(config):
     print(f"""
   {BOLD}Next steps:{D}
     1. {G}python itechkey_monitor.py{D}
-    2. Open {G}http://localhost:5000{D}
+    2. Open {G}http://localhost{D} (HTTP port 80; HTTPS needs a certificate)
     3. Login: {BOLD}admin / admin{D} {Y}→ change immediately!{D}
     4. Configure SMTP in Settings page.
     5. Add devices, discover interfaces, add sensors.
 
-  {BOLD}Production:{D}
-    gunicorn -w 4 --threads 8 -b 0.0.0.0:5000 itechkey_monitor:app
+    {BOLD}Production:{D}
+        Use a reverse proxy on ports 80/443 and bind the application backend to
+        127.0.0.1:5000. Run {G}python itechkey_collector.py{D} once alongside Gunicorn;
+        importing the Flask app does not start the collector.
 """)
 
 

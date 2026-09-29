@@ -20,7 +20,8 @@ APP_VERSION="1.0.0"
 VENV_DIR="venv"
 MIN_PYTHON_MAJOR=3
 MIN_PYTHON_MINOR=9
-PORT=5000
+HTTP_PORT=80
+HTTPS_PORT=443
 
 # ---- Colors ----
 if [ -t 1 ]; then
@@ -64,6 +65,7 @@ info "Working directory: $SCRIPT_DIR"
 # Required files check
 REQUIRED_FILES=(
     "itechkey_monitor.py"
+    "itechkey_collector.py"
     "itechkey_snmp.py"
     "itechkey_setup.py"
     "requirements.txt"
@@ -214,26 +216,29 @@ fi
 head "Firewall configuration (optional)"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
-    if command -v ufw >/dev/null 2>&1; then
-        if sudo -n true 2>/dev/null; then
-            if sudo ufw status 2>/dev/null | grep -q "$PORT"; then
-                ok "ufw rule already exists for port $PORT"
+    for PORT in "$HTTP_PORT" "$HTTPS_PORT"; do
+        if command -v ufw >/dev/null 2>&1; then
+            if sudo -n true 2>/dev/null; then
+                if sudo ufw status 2>/dev/null | grep -q "$PORT"; then
+                    ok "ufw rule already exists for port $PORT"
+                else
+                    info "Adding ufw rule for port $PORT..."
+                    sudo ufw allow "$PORT/tcp" >/dev/null 2>&1 && \
+                        ok "ufw rule added" || warn "Could not add ufw rule"
+                fi
             else
-                info "Adding ufw rule for port $PORT..."
-                sudo ufw allow "$PORT/tcp" >/dev/null 2>&1 && \
-                    ok "ufw rule added" || warn "Could not add ufw rule"
+                info "Skipping ufw (sudo required). Manual command:"
+                echo "     ${C}sudo ufw allow $PORT/tcp${D}"
             fi
+        elif command -v firewall-cmd >/dev/null 2>&1; then
+            info "firewalld detected. Manual command (if needed):"
+            echo "     ${C}sudo firewall-cmd --permanent --add-port=$PORT/tcp${D}"
+            echo "     ${C}sudo firewall-cmd --reload${D}"
         else
-            info "Skipping ufw (sudo required). Manual command:"
-            echo "     ${C}sudo ufw allow $PORT/tcp${D}"
+            info "No ufw or firewalld detected — skipping firewall config"
+            break
         fi
-    elif command -v firewall-cmd >/dev/null 2>&1; then
-        info "firewalld detected. Manual command (if needed):"
-        echo "     ${C}sudo firewall-cmd --permanent --add-port=$PORT/tcp${D}"
-        echo "     ${C}sudo firewall-cmd --reload${D}"
-    else
-        info "No ufw or firewalld detected — skipping firewall config"
-    fi
+    done
 else
     info "macOS — firewall handled by System Preferences"
 fi
@@ -253,8 +258,9 @@ printf "${G}  +----------------------------------------------------------------+
 printf "${G}  |                    Setup Complete!                             |${D}\n"
 printf "${G}  +----------------------------------------------------------------+${D}\n"
 echo ""
-printf "    Local URL      : ${C}http://localhost:%s${D}\n" "$PORT"
-printf "    Network URL    : ${C}http://%s:%s${D}\n" "$LAN_IP" "$PORT"
+printf "    Local URL      : ${C}http://localhost${D}\n"
+printf "    Network URL    : ${C}http://%s${D}\n" "$LAN_IP"
+printf "    HTTPS URL      : ${C}https://%s${D} (requires TLS certificate configuration)\n" "$LAN_IP"
 printf "    Login          : ${Y}admin / admin${D}\n"
 echo ""
 printf "    ${Y}IMPORTANT: Change password immediately in Settings!${D}\n"

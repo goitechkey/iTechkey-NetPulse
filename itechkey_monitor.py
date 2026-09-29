@@ -21,6 +21,7 @@ from functools import wraps
 from pathlib import Path
 from io import BytesIO
 from email.message import EmailMessage
+from urllib.parse import urlsplit, urlunsplit
 
 from flask import (
     Flask, render_template_string, request, redirect, url_for,
@@ -49,7 +50,7 @@ from reportlab.platypus import (
 
 from itechkey_snmp import (
     SNMPClient, SNMPError, SNMPTimeout,
-    discover_interfaces, IF_OPER_STATUS, IF_MIB,
+    discover_interfaces, discover_storage, IF_OPER_STATUS, IF_MIB,
 )
 
 
@@ -76,6 +77,10 @@ if _ENV_FILE.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 DB_BACKEND = os.environ.get("ITECHKEY_DB", "sqlite").lower()
+HTTP_PORT = int(os.environ.get("ITECHKEY_HTTP_PORT", 80))
+HTTPS_PORT = int(os.environ.get("ITECHKEY_HTTPS_PORT", 443))
+SSL_CERT_FILE = os.environ.get("ITECHKEY_SSL_CERT", "").strip()
+SSL_KEY_FILE = os.environ.get("ITECHKEY_SSL_KEY", "").strip()
 DB_FILE = BASE_DIR / "itechkey.db"
 LOG_FILE = BASE_DIR / "itechkey.log"
 SECRET_FILE = BASE_DIR / "itechkey_secret.key"
@@ -799,6 +804,15 @@ def check_snmp_traffic(sensor_row):
         "in_octets": in_oct, "out_octets": out_oct,
         "if_index": if_index, "oper_status": oper_str,
         "in_mbps": in_mbps, "out_mbps": out_mbps,
+        "capacity_mbps": params.get("capacity_mbps"),
+        "in_utilization_pct": (
+            round(in_mbps * 100 / float(params["capacity_mbps"]), 2)
+            if in_mbps is not None and params.get("capacity_mbps") else None
+        ),
+        "out_utilization_pct": (
+            round(out_mbps * 100 / float(params["capacity_mbps"]), 2)
+            if out_mbps is not None and params.get("capacity_mbps") else None
+        ),
     })
 
     if in_mbps is None:
@@ -814,6 +828,55 @@ def check_snmp_traffic(sensor_row):
         status = "down"
     msg = "IN %.2f Mbps | OUT %.2f Mbps | oper=%s" % (in_mbps, out_mbps, oper_str)
     return status, round(in_mbps, 3), msg, meta
+
+
+def check_snmp_storage(sensor_row):
+    params = json.loads(sensor_row["params"] or "{}")
+    storage_index = params.get("storage_index")
+    if not storage_index or str(storage_index) == "0":
+        return "down", None, "No storage index configured", None
+
+    dev = _sensor_device_ctx(sensor_row)
+    try:
+        cli = _snmp_for(dev, timeout=sensor_row["timeout_seconds"] or 5,
+                        retries=sensor_row["retries"] or 1)
+        values = cli.get(
+            "1.3.6.1.2.1.25.2.3.1.4." + str(storage_index),
+            "1.3.6.1.2.1.25.2.3.1.5." + str(storage_index),
+            "1.3.6.1.2.1.25.2.3.1.6." + str(storage_index),
+        )
+    except SNMPError as e:
+        return "down", None, "SNMP storage query failed: " + str(e), None
+    if not isinstance(values, (list, tuple)) or len(values) != 3:
+        return "down", None, "Storage index is unavailable", None
+    units, size, used = values
+
+    try:
+        units, size, used = int(units), int(size), int(used)
+    except (TypeError, ValueError):
+        return "down", None, "Storage index is unavailable", None
+    if units <= 0 or size <= 0 or used < 0:
+        return "down", None, "Invalid storage capacity data", None
+
+    total_bytes = units * size
+    used_bytes = units * used
+    used_pct = min(100.0, used_bytes * 100.0 / total_bytes)
+    warning = sensor_row["warning_latency_ms"]
+    error = sensor_row["error_latency_ms"]
+    status = "down" if error is not None and used_pct >= error else (
+        "warning" if warning is not None and used_pct >= warning else "up"
+    )
+    description = params.get("description") or "Storage " + str(storage_index)
+    meta = json.dumps({
+        "storage_index": storage_index, "description": description,
+        "used_bytes": used_bytes, "total_bytes": total_bytes,
+        "used_percent": round(used_pct, 2),
+    })
+    message = "%s: %.1f%% used (%.2f / %.2f GiB)" % (
+        description, used_pct,
+        used_bytes / (1024 ** 3), total_bytes / (1024 ** 3),
+    )
+    return status, round(used_pct, 2), message, meta
 
 
 def check_snmp_interface(sensor_row):
@@ -924,6 +987,8 @@ def run_sensor_check(sensor_row):
         return check_snmp_traffic(sensor_row)
     if stype == "snmp_interface":
         return check_snmp_interface(sensor_row)
+    if stype == "snmp_storage":
+        return check_snmp_storage(sensor_row)
     if stype == "firewall_health":
         return check_firewall_health(sensor_row)
     return "down", None, "Unknown sensor type: " + stype, None
@@ -1562,12 +1627,12 @@ SENSOR_DETAIL_HTML = """
 <b>Interval:</b> {{ sensor.interval_seconds }}s</div>
 {% if last %}<div style="margin-top:12px;font-size:14px">
 <b>Last check:</b> {{ last.timestamp }} —
-{% if last.latency_ms is not none %}<b>{{ '%.1f'|format(last.latency_ms) }} ms</b>{% endif %}
+{% if last.latency_ms is not none %}<b>{{ '%.1f'|format(last.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% elif sensor.sensor_type == 'snmp_traffic' %} Mbps{% else %} ms{% endif %}</b>{% endif %}
 — {{ last.message }}</div>{% endif %}
 </div>
 <div class="card">
 <div class="toolbar" style="margin-bottom:6px">
-<h2 style="margin:0">Latency History</h2><span class="spacer"></span>
+<h2 style="margin:0">{% if sensor.sensor_type == 'snmp_traffic' %}Traffic History{% elif sensor.sensor_type == 'snmp_storage' %}Storage Utilization History{% else %}Latency History{% endif %}</h2><span class="spacer"></span>
 <select id="rangeSel" onchange="loadChart()">
 <option value="24">Last 24 hours</option>
 <option value="168">Last 7 days</option>
@@ -1575,10 +1640,10 @@ SENSOR_DETAIL_HTML = """
 </select></div>
 <div class="chart-box"><canvas id="chart"></canvas></div></div>
 <div class="card"><h2>Recent Checks (latest 100)</h2>
-<table><tr><th>Timestamp</th><th>Status</th><th>Latency</th><th>Message</th></tr>
+<table><tr><th>Timestamp</th><th>Status</th><th>Value</th><th>Message</th></tr>
 {% for r in recent %}<tr><td>{{ r.timestamp }}</td>
 <td><span class="badge {{ r.status }}">{{ r.status|upper }}</span></td>
-<td>{{ '%.1f ms'|format(r.latency_ms) if r.latency_ms is not none else '-' }}</td>
+<td>{% if r.latency_ms is not none %}{{ '%.1f'|format(r.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% elif sensor.sensor_type == 'snmp_traffic' %} Mbps{% else %} ms{% endif %}{% else %}-{% endif %}</td>
 <td>{{ r.message }}</td></tr>{% endfor %}</table></div>
 <script>
 let chart;
@@ -1588,14 +1653,19 @@ async function loadChart(){
   const data = await res.json();
   const ctx = document.getElementById('chart').getContext('2d');
   if (chart) chart.destroy();
-  chart = new Chart(ctx,{type:'line',data:{labels:data.labels,datasets:[{
-    label:'Latency (ms)',data:data.values,borderColor:'#0a66c2',
-    backgroundColor:'rgba(10,102,194,.15)',fill:true,tension:.25,
-    pointRadius:0,borderWidth:2,spanGaps:false}]},
+    const isTraffic='{{ sensor.sensor_type }}'==='snmp_traffic';
+    const unit='{{ sensor.sensor_type }}'==='snmp_storage'?'%':(isTraffic?'Mbps':'ms');
+    const datasets=isTraffic?[
+        {label:'IN (Mbps)',data:data.in_values,borderColor:'#0a66c2',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false},
+        {label:'OUT (Mbps)',data:data.out_values,borderColor:'#6f42c1',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}
+    ]:[{label:unit==='%'?'Used (%)':'Latency (ms)',data:data.values,borderColor:'#0a66c2',
+        backgroundColor:'rgba(10,102,194,.15)',fill:true,tension:.25,
+        pointRadius:0,borderWidth:2,spanGaps:false}];
+    chart = new Chart(ctx,{type:'line',data:{labels:data.labels,datasets:datasets},
     options:{responsive:true,maintainAspectRatio:false,
     interaction:{mode:'index',intersect:false},
-    scales:{y:{beginAtZero:true,title:{display:true,text:'ms'}},
-    x:{ticks:{maxTicksLimit:12}}},plugins:{legend:{display:false}}}});
+    scales:{y:{beginAtZero:true,title:{display:true,text:unit}},
+    x:{ticks:{maxTicksLimit:12}}},plugins:{legend:{display:isTraffic}}}});
 }
 loadChart();
 </script>
@@ -1646,22 +1716,26 @@ def api_series(sid):
     conn = db()
     try:
         rows = conn.execute(
-            "SELECT timestamp, latency_ms FROM sensor_data "
+            "SELECT timestamp, latency_ms, value_in, value_out FROM sensor_data "
             "WHERE sensor_id = ? AND timestamp >= ? ORDER BY timestamp",
             (sid, cutoff)).fetchall()
     finally:
         conn.close()
 
     step = max(1, len(rows) // MAX_POINTS_CHART) if rows else 1
-    labels, values = [], []
+    labels, values, in_values, out_values = [], [], [], []
     for i in range(0, len(rows), step):
         chunk = rows[i:i + step]
-        vals = [r["latency_ms"] for r in chunk if r["latency_ms"] is not None]
-        avg = sum(vals) / len(vals) if vals else None
+        def average(key):
+            vals = [r[key] for r in chunk if r[key] is not None]
+            return round(sum(vals) / len(vals), 3) if vals else None
         ts = chunk[0]["timestamp"]
         labels.append(ts[11:16] if isinstance(ts, str) else ts.strftime("%H:%M"))
-        values.append(round(avg, 1) if avg is not None else None)
-    return jsonify({"labels": labels, "values": values})
+        values.append(average("latency_ms"))
+        in_values.append(average("value_in"))
+        out_values.append(average("value_out"))
+    return jsonify({"labels": labels, "values": values,
+                    "in_values": in_values, "out_values": out_values})
 
 
 @app.route("/api/status")
@@ -1753,6 +1827,7 @@ style="display:inline" onsubmit="return confirm('Delete?')">
 <td>{{ d.tags or '' }}</td><td>{{ d.sensor_count }}</td>
 <td>
 <a class="btn small" href="{{ url_for('device_interfaces', did=d.id) }}">Interfaces</a>
+<a class="btn small grey" href="{{ url_for('device_storage', did=d.id) }}">Storage</a>
 <a class="btn small grey" href="{{ url_for('device_edit', did=d.id) }}">Edit</a>
 <form method="post" action="{{ url_for('device_delete', did=d.id) }}"
 style="display:inline" onsubmit="return confirm('Delete?')">
@@ -1780,6 +1855,114 @@ def devices():
     body = render_template_string(DEVICES_HTML, groups=groups, devices=devs,
                                   url_for=url_for)
     return render_ctx(body, "Devices", "devices")
+
+
+STORAGE_DISCOVERY_HTML = """
+<div class="toolbar"><h1 style="margin:0">{{ dev.name }} — Storage</h1>
+<span class="spacer"></span>
+<a class="btn grey" href="{{ url_for('devices') }}">← Devices</a>
+<a class="btn grey" href="{{ url_for('device_storage', did=dev.id) }}">↻ Discover</a></div>
+<div class="card">
+<p>Discover logical volumes reported by HOST-RESOURCES-MIB. A sensor reports
+volume availability and used percentage; generic SNMP cannot verify physical-disk SMART health.</p>
+{% if err %}<div class="flash err">{{ err }}</div>{% endif %}
+{% if not creds_ok %}<p>Attach SNMP credentials to this device before discovering storage.</p>
+{% elif storages %}
+<form method="post"><div class="row">
+<div><label>Warning at (%)</label><input type="number" name="warning_pct" min="1" max="100" value="80"></div>
+<div><label>Critical at (%)</label><input type="number" name="critical_pct" min="1" max="100" value="90"></div>
+<div><label>Poll interval (seconds)</label><input type="number" name="interval" min="5" value="60"></div>
+</div>
+<table><tr><th></th><th>Volume</th><th>Used</th><th>Total</th><th>Utilization</th></tr>
+{% for s in storages %}<tr>
+<td><input type="checkbox" name="selected_storage" value="{{ s.storage_index }}|{{ s.description }}"></td>
+<td>{{ s.description }}</td>
+<td>{{ '%.2f'|format(s.used_bytes / (1024**3)) }} GiB</td>
+<td>{{ '%.2f'|format(s.total_bytes / (1024**3)) }} GiB</td>
+<td>{{ '%.1f'|format(s.used_percent) }}%</td></tr>{% endfor %}
+</table><button class="btn green" type="submit">Add selected storage sensors</button></form>
+{% elif not err %}<p>No logical storage rows were returned by this device.</p>{% endif %}
+</div>
+"""
+
+
+@app.route("/devices/<int:did>/storage", methods=["GET", "POST"])
+@login_required
+def device_storage(did):
+    conn = db()
+    try:
+        dev = conn.execute(
+            "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port "
+            "FROM devices d LEFT JOIN snmp_credentials c "
+            "ON c.id = d.snmp_cred_id WHERE d.id = ?", (did,)
+        ).fetchone()
+        if not dev:
+            abort(404)
+    finally:
+        conn.close()
+
+    storages, err = [], None
+    if dev["community"] and request.method == "GET":
+        try:
+            storages = discover_storage(_snmp_for(dev, timeout=4, retries=1))
+        except Exception as e:
+            err = "SNMP storage discovery failed: " + str(e)
+
+    if request.method == "POST":
+        try:
+            warning_pct = max(1, min(100, int(request.form.get("warning_pct", 80))))
+            critical_pct = max(warning_pct, min(100, int(request.form.get("critical_pct", 90))))
+            interval = max(5, int(request.form.get("interval", 60)))
+        except ValueError:
+            return _flash_redirect(url_for("device_storage", did=did),
+                                   "Invalid threshold or interval", "err")
+        selected = request.form.getlist("selected_storage")
+        if not selected:
+            return _flash_redirect(url_for("device_storage", did=did),
+                                   "Select at least one volume", "err")
+        conn = db()
+        try:
+            existing = conn.execute(
+                "SELECT params FROM sensors WHERE device_id = ? AND sensor_type = ?",
+                (did, "snmp_storage"),
+            ).fetchall()
+            existing_indices = set()
+            for row in existing:
+                try:
+                    existing_indices.add(str(json.loads(row["params"] or "{}").get("storage_index")))
+                except (ValueError, TypeError):
+                    continue
+            created = 0
+            now = datetime.now().isoformat(timespec="seconds")
+            for item in selected:
+                index, separator, description = item.partition("|")
+                if not index.isdigit() or index in existing_indices:
+                    continue
+                params = json.dumps({"storage_index": index,
+                                     "description": description[:120]})
+                conn.execute(
+                    "INSERT INTO sensors "
+                    "(device_id, name, sensor_type, params, interval_seconds, "
+                    "timeout_seconds, retries, enabled, warning_latency_ms, "
+                    "error_latency_ms, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (did, "Storage " + (description[:80] or index),
+                     "snmp_storage", params, interval, 5, 1, 1,
+                     warning_pct, critical_pct, now),
+                )
+                existing_indices.add(index)
+                created += 1
+            conn.commit()
+        finally:
+            conn.close()
+        return _flash_redirect(url_for("device_storage", did=did),
+                               "%d storage sensor(s) created" % created)
+
+    body = render_template_string(
+        STORAGE_DISCOVERY_HTML, dev=dev, storages=storages, err=err,
+        creds_ok=bool(dev["community"]), url_for=url_for,
+    )
+    return render_ctx(body, "Storage — " + dev["name"], "devices")
 
 
 DEVICE_FORM_HTML = """
@@ -2073,7 +2256,7 @@ INTERFACES_HTML = """
 <div class="card" style="background:#f8f9fb;border-left:5px solid var(--primary)">
 <h2 style="margin-top:0">⚡ Bulk Add Sensors</h2>
 <p style="color:#6c757d;font-size:13px;margin-bottom:12px">
-Select interfaces using checkboxes below, configure options, then click "Add Selected Sensors".
+Select one or more interfaces below, configure options, then click "Add Selected Sensors".
 </p>
 <div class="row">
 <div><label>Sensor Types</label>
@@ -2107,13 +2290,13 @@ placeholder="95% of link speed"></div>
 <input type="checkbox" id="selectAll" onchange="toggleAll(this)">
 </th>
 <th>Idx</th><th>Name</th><th>Alias</th><th>Type</th>
-<th>Oper</th><th>Speed</th><th>Individual Add</th>
+<th>Oper</th><th>Speed</th>
 </tr>
 {% for i in ifaces %}
 <tr>
 <td>
 <input type="checkbox" name="selected_if"
-value="{{ i.if_index }}|{{ i.name or i.descr or ('if' + i.if_index) }}|{{ i.alias or '' }}"
+value="{{ i.if_index }}|{{ i.name or i.descr or ('if' + i.if_index) }}|{{ i.alias or '' }}|{{ i.speed_mbps or '' }}"
 class="if-checkbox">
 </td>
 <td>{{ i.if_index }}</td>
@@ -2123,26 +2306,6 @@ class="if-checkbox">
 <td>{% if i.oper_status == 'up' %}<span class="badge up">UP</span>
 {% elif i.oper_status %}<span class="badge down">{{ i.oper_status }}</span>{% endif %}</td>
 <td>{% if i.speed_mbps %}{{ i.speed_mbps }} Mbps{% else %}—{% endif %}</td>
-<td>
-<form method="post" action="{{ url_for('device_interface_add_sensor', did=dev.id) }}"
-style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin:0">
-<input type="hidden" name="if_index" value="{{ i.if_index }}">
-<input type="hidden" name="if_name"
-value="{{ i.name or i.descr or ('if' + i.if_index) }}">
-<input type="hidden" name="if_alias" value="{{ i.alias or '' }}">
-<label style="margin:0;font-size:11px">
-<input type="checkbox" name="create_traffic" value="1" checked> T</label>
-<label style="margin:0;font-size:11px">
-<input type="checkbox" name="create_status" value="1"> S</label>
-<input type="number" name="warn_mbps" placeholder="warn"
-style="width:60px;font-size:11px;padding:3px 5px">
-<input type="number" name="err_mbps" placeholder="err"
-style="width:50px;font-size:11px;padding:3px 5px">
-<input type="number" name="interval" value="60"
-style="width:50px;font-size:11px;padding:3px 5px">
-<button class="btn small green" style="padding:3px 8px;font-size:11px">Add</button>
-</form>
-</td>
 </tr>
 {% endfor %}
 </table>
@@ -2207,6 +2370,11 @@ def device_interface_add_sensor(did):
 
     if_name = (request.form.get("if_name") or ("if" + str(if_index))).strip()[:40]
     alias = (request.form.get("if_alias") or "").strip()[:60]
+    try:
+        capacity_mbps = float(request.form.get("capacity_mbps") or 0)
+        capacity_mbps = capacity_mbps if capacity_mbps > 0 else None
+    except ValueError:
+        capacity_mbps = None
     want_traffic = request.form.get("create_traffic") == "1"
     want_status = request.form.get("create_status") == "1"
 
@@ -2237,7 +2405,8 @@ def device_interface_add_sensor(did):
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (did, "Traffic " + if_name, "snmp_traffic",
                  json.dumps({"if_index": if_index, "if_name": if_name,
-                             "if_alias": alias}),
+                             "if_alias": alias,
+                             "capacity_mbps": capacity_mbps}),
                  interval, 5, 1, 1,
                  int(warn_mbps) if warn_mbps is not None else None,
                  int(err_mbps) if err_mbps is not None else None, now))
@@ -2292,7 +2461,7 @@ def device_interface_bulk_add(did):
     conn = db()
     try:
         for entry in selected:
-            parts = entry.split("|", 2)
+            parts = entry.split("|", 3)
             if len(parts) < 2:
                 continue
             try:
@@ -2301,6 +2470,11 @@ def device_interface_bulk_add(did):
                 continue
             if_name = parts[1][:40]
             alias = (parts[2] if len(parts) > 2 else "")[:60]
+            try:
+                capacity_mbps = float(parts[3]) if len(parts) > 3 and parts[3] else None
+                capacity_mbps = capacity_mbps if capacity_mbps and capacity_mbps > 0 else None
+            except ValueError:
+                capacity_mbps = None
 
             def sensor_exists(stype):
                 row = conn.execute(
@@ -2319,7 +2493,8 @@ def device_interface_bulk_add(did):
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (did, "Traffic " + if_name, "snmp_traffic",
                      json.dumps({"if_index": if_index, "if_name": if_name,
-                                 "if_alias": alias}),
+                                 "if_alias": alias,
+                                 "capacity_mbps": capacity_mbps}),
                      interval, 5, 1, 1,
                      int(warn_mbps) if warn_mbps is not None else None,
                      int(err_mbps) if err_mbps is not None else None, now))
@@ -2349,38 +2524,81 @@ def device_interface_bulk_add(did):
 TRAFFIC_HTML = """
 <div class="toolbar"><h1 style="margin:0">Traffic & Firewall Health</h1>
 <span class="spacer"></span>
+<span style="font-size:12px;color:#6c757d">Live refresh: every 10 seconds</span>
 <a class="btn grey" href="{{ url_for('traffic_dashboard') }}">↻ Refresh</a></div>
 {% if rows %}<div class="grid">
 {% for r in rows %}
 <a href="{{ url_for('sensor_detail', sid=r.id) }}"
    style="text-decoration:none;color:inherit">
-<div class="sensor-card {{ r.status or 'paused' }}">
+<div class="sensor-card {{ r.status or 'paused' }}" id="traffic-card-{{ r.id }}">
 <h3>{{ r.name }}</h3>
 <div class="meta">{{ r.gname or '—' }} / {{ r.dname }} ({{ r.host }})</div>
 {% if r.sensor_type == 'snmp_traffic' %}
 <div style="display:flex;gap:14px;font-weight:800">
 <div><div style="font-size:10px;color:#5b6b7b">IN</div>
 <div style="color:#0a66c2">
-{{ '%.2f'|format(r.v_in) if r.v_in is not none else '—' }}
+<span id="traffic-in-{{ r.id }}">{{ '%.2f'|format(r.v_in) if r.v_in is not none else '—' }}</span>
 <span style="font-size:11px">Mbps</span></div></div>
 <div><div style="font-size:10px;color:#5b6b7b">OUT</div>
 <div style="color:#6f42c1">
-{{ '%.2f'|format(r.v_out) if r.v_out is not none else '—' }}
+<span id="traffic-out-{{ r.id }}">{{ '%.2f'|format(r.v_out) if r.v_out is not none else '—' }}</span>
 <span style="font-size:11px">Mbps</span></div></div>
+<div><div style="font-size:10px;color:#5b6b7b">LINK UTIL.</div>
+<div style="color:#0f766e"><span id="traffic-util-{{ r.id }}">—</span>
+<span style="font-size:11px">%</span></div></div>
 </div>
+{% elif r.sensor_type == 'snmp_storage' %}
+<div class="lat"><span id="storage-util-{{ r.id }}">{{ '%.1f'|format(r.value1) if r.value1 is not none else '—' }}</span>% used</div>
 {% else %}
 <div class="lat">
 {% if r.value1 is not none %}{{ '%.0f'|format(r.value1) }}{% else %}—{% endif %}
 </div>
 {% endif %}
-<div class="msg">{{ r.msg or '' }}</div>
-<div style="font-size:10px;color:#adb5bd;margin-top:6px">{{ r.ts or '' }}</div>
+<div class="msg" id="traffic-msg-{{ r.id }}">{{ r.msg or '' }}</div>
+<div style="font-size:10px;color:#adb5bd;margin-top:6px" id="traffic-ts-{{ r.id }}">{{ r.ts or '' }}</div>
+<span class="badge {{ r.status or 'paused' }}" id="traffic-status-{{ r.id }}">{{ (r.status or 'paused')|upper }}</span>
 </div></a>
 {% endfor %}</div>
 {% else %}
 <div class="card">No traffic sensors. <a href="{{ url_for('devices') }}">Devices</a>
 → Interfaces → Add monitoring.</div>
 {% endif %}
+<script>
+async function refreshTraffic(){
+    try{
+        const response=await fetch('/api/traffic',{cache:'no-store'});
+        if(!response.ok)return;
+        const data=await response.json();
+        data.sensors.forEach(function(s){
+            const card=document.getElementById('traffic-card-'+s.id);
+            if(!card)return;
+            const status=s.status||'paused';
+            card.classList.remove('up','warning','down','paused');card.classList.add(status);
+            const badge=document.getElementById('traffic-status-'+s.id);
+            if(badge){badge.className='badge '+status;badge.textContent=status.toUpperCase();}
+            const msg=document.getElementById('traffic-msg-'+s.id);
+            if(msg)msg.textContent=s.message||'';
+            const ts=document.getElementById('traffic-ts-'+s.id);
+            if(ts)ts.textContent=s.timestamp||'';
+            if(s.sensor_type==='snmp_traffic'){
+                const inEl=document.getElementById('traffic-in-'+s.id);
+                const outEl=document.getElementById('traffic-out-'+s.id);
+                const utilEl=document.getElementById('traffic-util-'+s.id);
+                if(inEl)inEl.textContent=s.value_in==null?'—':Number(s.value_in).toFixed(2);
+                if(outEl)outEl.textContent=s.value_out==null?'—':Number(s.value_out).toFixed(2);
+                if(utilEl)utilEl.textContent=s.meta&&s.meta.capacity_mbps
+                    ?Math.max(s.meta.in_utilization_pct||0,s.meta.out_utilization_pct||0).toFixed(1):'—';
+            }
+            if(s.sensor_type==='snmp_storage'){
+                const utilEl=document.getElementById('storage-util-'+s.id);
+                if(utilEl)utilEl.textContent=s.value==null?'—':Number(s.value).toFixed(1);
+            }
+        });
+    }catch(error){console.warn('Live traffic refresh failed',error);}
+}
+setInterval(refreshTraffic,10000);
+refreshTraffic();
+</script>
 """
 
 
@@ -2408,12 +2626,39 @@ def traffic_dashboard():
             "JOIN devices d ON d.id = s.device_id "
             "LEFT JOIN groups g ON g.id = d.group_id "
             "WHERE s.sensor_type IN "
-            "('snmp_traffic', 'snmp_interface', 'firewall_health') "
+            "('snmp_traffic', 'snmp_interface', 'firewall_health', 'snmp_storage') "
             "ORDER BY g.name, d.name, s.name").fetchall()
     finally:
         conn.close()
     body = render_template_string(TRAFFIC_HTML, rows=rows, url_for=url_for)
     return render_ctx(body, "Traffic", "traffic")
+
+
+@app.route("/api/traffic")
+@login_required
+def api_traffic():
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT s.id, s.sensor_type, sd.status, sd.latency_ms AS value, "
+            "sd.value_in, sd.value_out, sd.message, sd.timestamp, sd.meta "
+            "FROM sensors s LEFT JOIN sensor_data sd ON sd.id = "
+            "(SELECT MAX(id) FROM sensor_data WHERE sensor_id = s.id) "
+            "WHERE s.sensor_type IN "
+            "('snmp_traffic', 'snmp_interface', 'firewall_health', 'snmp_storage') "
+            "ORDER BY s.id"
+        ).fetchall()
+    finally:
+        conn.close()
+    sensors = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["meta"] = json.loads(item["meta"]) if item["meta"] else {}
+        except (ValueError, TypeError):
+            item["meta"] = {}
+        sensors.append(item)
+    return jsonify({"sensors": sensors, "generated_at": datetime.now().isoformat(timespec="seconds")})
 
 
 # ============================================================================
@@ -2471,7 +2716,7 @@ SENSOR_FORM_HTML = """
 <input name="name" required value="{{ sensor.name if sensor else '' }}"></div>
 <div><label>Type</label>
 <select name="sensor_type" id="stype" onchange="updateTypeFields()">
-{% for t in ['ping','tcp','http','https','dns','snmp_traffic','snmp_interface','firewall_health'] %}
+{% for t in ['ping','tcp','http','https','dns','snmp_traffic','snmp_interface','snmp_storage','firewall_health'] %}
 <option value="{{ t }}" {{ 'selected' if sensor and sensor.sensor_type==t }}>{{ t }}</option>
 {% endfor %}</select></div></div>
 <div class="row" id="typeRow">
@@ -2483,6 +2728,16 @@ placeholder="https://example.com/health"></div>
 <div id="ifField" style="display:none;flex:2"><label>Interface Index</label>
 <input name="if_index" id="if_index"
 value="{{ params.if_index if params and params.if_index else '' }}"></div>
+<div id="capacityField" style="display:none"><label>Link capacity (Mbps)</label>
+<input type="number" min="0.1" step="any" name="capacity_mbps"
+value="{{ params.capacity_mbps if params and params.capacity_mbps else '' }}"
+placeholder="WAN plan speed or port speed"></div>
+<div id="storageField" style="display:none"><label>Storage index</label>
+<input name="storage_index" id="storage_index"
+value="{{ params.storage_index if params and params.storage_index else '' }}"></div>
+<div id="storageDescField" style="display:none;flex:2"><label>Volume description</label>
+<input name="storage_description" id="storage_description"
+value="{{ params.description if params and params.description else '' }}"></div>
 <div id="vendorField" style="display:none"><label>Vendor</label>
 <select name="vendor" id="vendor">
 {% for v in ['fortinet','paloalto','cisco_asa','pfsense','sophos'] %}
@@ -2499,10 +2754,10 @@ value="{{ sensor.timeout_seconds if sensor else 5 }}"></div>
 <input type="number" name="retries" min="0"
 value="{{ sensor.retries if sensor else 2 }}"></div></div>
 <div class="row">
-<div><label>Warning threshold</label>
+<div><label id="warningLabel">Warning threshold</label>
 <input type="number" name="warning_latency_ms"
 value="{{ sensor.warning_latency_ms if sensor and sensor.warning_latency_ms is not none else 100 }}"></div>
-<div><label>Error threshold</label>
+<div><label id="errorLabel">Error threshold</label>
 <input type="number" name="error_latency_ms"
 value="{{ sensor.error_latency_ms if sensor and sensor.error_latency_ms is not none else 300 }}"></div>
 <div><label>&nbsp;</label>
@@ -2518,7 +2773,18 @@ function updateTypeFields(){
   document.getElementById('portField').style.display=(t==='tcp')?'block':'none';
   document.getElementById('urlField').style.display=(t==='http'||t==='https')?'block':'none';
   document.getElementById('ifField').style.display=(t==='snmp_traffic'||t==='snmp_interface')?'block':'none';
+    document.getElementById('capacityField').style.display=(t==='snmp_traffic')?'block':'none';
+    document.getElementById('storageField').style.display=(t==='snmp_storage')?'block':'none';
+    document.getElementById('storageDescField').style.display=(t==='snmp_storage')?'block':'none';
   document.getElementById('vendorField').style.display=(t==='firewall_health')?'block':'none';
+    document.getElementById('warningLabel').textContent=t==='snmp_storage'?'Warning (%)':'Warning threshold';
+    document.getElementById('errorLabel').textContent=t==='snmp_storage'?'Critical (%)':'Error threshold';
+    if(t==='snmp_storage'){
+        const warning=document.querySelector('[name="warning_latency_ms"]');
+        const critical=document.querySelector('[name="error_latency_ms"]');
+        if(warning.value==='100')warning.value='80';
+        if(critical.value==='300')critical.value='90';
+    }
 }
 updateTypeFields();
 </script>
@@ -2542,6 +2808,18 @@ def _parse_sensor_form():
             params["if_index"] = int(request.form.get("if_index") or 0)
         except ValueError:
             params["if_index"] = 0
+    if st == "snmp_traffic":
+        try:
+            capacity_mbps = float(request.form.get("capacity_mbps") or 0)
+            params["capacity_mbps"] = capacity_mbps if capacity_mbps > 0 else None
+        except ValueError:
+            params["capacity_mbps"] = None
+    if st == "snmp_storage":
+        try:
+            params["storage_index"] = int(request.form.get("storage_index") or 0)
+        except ValueError:
+            params["storage_index"] = 0
+        params["description"] = request.form.get("storage_description", "").strip()[:120]
     if st == "firewall_health":
         params["vendor"] = request.form.get("vendor", "fortinet")
 
@@ -3046,14 +3324,79 @@ def print_banner():
     print(" Real-time ping · SNMP · Firewall & L3 traffic")
     print("=" * 66)
     print("  Backend     : %s" % DB_BACKEND.upper())
-    print("  Local URL   : http://127.0.0.1:5000")
-    print("  Network URL : http://%s:5000" % ip)
+    http_suffix = "" if HTTP_PORT == 80 else ":%d" % HTTP_PORT
+    https_suffix = "" if HTTPS_PORT == 443 else ":%d" % HTTPS_PORT
+    print("  Local URL   : http://127.0.0.1%s" % http_suffix)
+    print("  Network URL : http://%s%s" % (ip, http_suffix))
+    if SSL_CERT_FILE and SSL_KEY_FILE:
+        print("  HTTPS URL   : https://127.0.0.1%s" % https_suffix)
+        print("  Network TLS : https://%s%s" % (ip, https_suffix))
+    else:
+        print("  HTTPS       : Set ITECHKEY_SSL_CERT and ITECHKEY_SSL_KEY in .env to enable")
     print("  Login       : admin / admin  (change immediately!)")
     print("  Workers     : %d parallel pollers" % MONITOR_WORKERS)
     print("  Author      : %s · %s" % (__author__, __contact__))
     print("=" * 66)
     print("  Press Ctrl+C to stop.")
     print("=" * 66, flush=True)
+
+
+def run_web_servers():
+    from werkzeug.serving import make_server
+
+    if not 1 <= HTTP_PORT <= 65535 or not 1 <= HTTPS_PORT <= 65535:
+        raise ValueError("HTTP and HTTPS ports must be between 1 and 65535")
+    if HTTP_PORT == HTTPS_PORT:
+        raise ValueError("HTTP and HTTPS ports must be different")
+    if bool(SSL_CERT_FILE) != bool(SSL_KEY_FILE):
+        raise ValueError("Set both ITECHKEY_SSL_CERT and ITECHKEY_SSL_KEY to enable HTTPS")
+
+    http_app = Flask(__name__ + "_http_redirect")
+
+    @http_app.route("/", defaults={"path": ""}, methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    @http_app.route("/<path:path>", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    def redirect_to_https(path):
+        parsed = urlsplit(request.url)
+        host = parsed.hostname or request.host
+        if ":" in host and not host.startswith("["):
+            host = "[%s]" % host
+        netloc = host if HTTPS_PORT == 443 else "%s:%d" % (host, HTTPS_PORT)
+        location = urlunsplit(("https", netloc, request.path, request.query_string.decode("latin1"), ""))
+        return redirect(location, code=308)
+
+    tls_context = None
+    if SSL_CERT_FILE:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_context.load_cert_chain(SSL_CERT_FILE, SSL_KEY_FILE)
+
+    http_server = make_server(
+        "0.0.0.0", HTTP_PORT, http_app if tls_context else app, threaded=True
+    )
+    https_server = (
+        make_server("0.0.0.0", HTTPS_PORT, app, threaded=True, ssl_context=tls_context)
+        if tls_context else None
+    )
+
+    servers = [http_server]
+    if https_server:
+        servers.append(https_server)
+
+    server_threads = []
+    for server in servers:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        server_threads.append(thread)
+
+    try:
+        for thread in server_threads:
+            thread.join()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
@@ -3071,4 +3414,4 @@ if __name__ == "__main__":
         sys.exit(1)
     start_monitor()
     print_banner()
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    run_web_servers()

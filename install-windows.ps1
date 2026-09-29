@@ -20,7 +20,8 @@ $ErrorActionPreference = "Stop"
 
 # ---- Config ----
 $VenvDir    = "venv"
-$Port       = 5000
+$HttpPort   = 80
+$HttpsPort  = 443
 
 # ---- Colors ----
 function Write-OK   ($m) { Write-Host "  [OK]   $m" -ForegroundColor Green }
@@ -52,6 +53,7 @@ Write-Info "Working directory: $ScriptDir"
 # Verify required files exist
 $RequiredFiles = @(
     "itechkey_monitor.py",
+    "itechkey_collector.py",
     "itechkey_snmp.py",
     "itechkey_setup.py",
     "requirements.txt"
@@ -195,24 +197,26 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] `
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if ($isAdmin) {
-    $ruleName = "iTechkey NetPulse (Port $Port)"
-    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-    if ($existing) {
-        Write-OK "Firewall rule already exists"
-    } else {
-        try {
-            New-NetFirewallRule -DisplayName $ruleName `
-                -Direction Inbound -Protocol TCP -LocalPort $Port `
-                -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-            Write-OK "Firewall rule added for port $Port"
-        } catch {
-            Write-Warn "Could not add firewall rule (non-fatal)"
+    foreach ($port in @($HttpPort, $HttpsPort)) {
+        $ruleName = "iTechkey NetPulse (Port $port)"
+        $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-OK "Firewall rule already exists for port $port"
+        } else {
+            try {
+                New-NetFirewallRule -DisplayName $ruleName `
+                    -Direction Inbound -Protocol TCP -LocalPort $port `
+                    -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                Write-OK "Firewall rule added for port $port"
+            } catch {
+                Write-Warn "Could not add firewall rule for port $port (non-fatal)"
+            }
         }
     }
 } else {
     Write-Info "Not running as Administrator - skipping firewall rule."
     Write-Info "Other devices on LAN need this. Manual command (Admin PS):"
-    Write-Host ('     New-NetFirewallRule -DisplayName "iTechkey NetPulse" -Direction Inbound -Protocol TCP -LocalPort {0} -Action Allow' -f $Port) -ForegroundColor Gray
+    Write-Host ('     New-NetFirewallRule -DisplayName "iTechkey NetPulse HTTP/HTTPS" -Direction Inbound -Protocol TCP -LocalPort {0},{1} -Action Allow' -f $HttpPort, $HttpsPort) -ForegroundColor Gray
 }
 
 # ---- Step 6: Launch app ----
@@ -236,9 +240,11 @@ Write-Host "  Setup Complete!" -ForegroundColor Green
 Write-Host ("  " + ("=" * 64)) -ForegroundColor Green
 Write-Host ""
 Write-Host "    Local URL      : " -NoNewline
-Write-Host "http://localhost:$Port" -ForegroundColor Cyan
+Write-Host "http://localhost" -ForegroundColor Cyan
 Write-Host "    Network URL    : " -NoNewline
-Write-Host "http://${lanIP}:$Port" -ForegroundColor Cyan
+Write-Host "http://${lanIP}" -ForegroundColor Cyan
+Write-Host "    HTTPS URL      : " -NoNewline
+Write-Host "https://${lanIP} (requires TLS certificate configuration)" -ForegroundColor Cyan
 Write-Host "    Login          : " -NoNewline
 Write-Host "admin / admin" -ForegroundColor Yellow
 Write-Host ""
