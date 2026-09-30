@@ -729,6 +729,31 @@ def _snmp_for(dev, timeout=5, retries=1):
     )
 
 
+def _format_traffic_rate(mbps):
+    if mbps is None:
+        return "—"
+    rate = float(mbps)
+    if rate == 0:
+        return "0 bps"
+    if 0 < abs(rate) < 0.001:
+        return "%.2f bps" % (rate * 1_000_000)
+    if 0 < abs(rate) < 1:
+        return "%.3f Kbps" % (rate * 1000)
+    return "%.4f Mbps" % rate
+
+
+app.jinja_env.filters["traffic_rate"] = _format_traffic_rate
+
+
+def _counter_delta(current, previous, counter_bits):
+    if current >= previous:
+        return current - previous
+    maximum = 1 << counter_bits
+    if previous * 4 >= maximum * 3 and current * 4 <= maximum:
+        return maximum - previous + current
+    return None
+
+
 def check_snmp_traffic(sensor_row):
     params = json.loads(sensor_row["params"] or "{}")
     if_index = params.get("if_index")
@@ -743,6 +768,7 @@ def check_snmp_traffic(sensor_row):
         return "down", None, "SNMP: " + str(e), None
 
     in_oct = out_oct = None
+    counter_bits = 64
     try:
         in_oct = cli.get("1.3.6.1.2.1.31.1.1.1.6." + str(if_index))
         out_oct = cli.get("1.3.6.1.2.1.31.1.1.1.10." + str(if_index))
@@ -753,6 +779,7 @@ def check_snmp_traffic(sensor_row):
         try:
             in_oct = cli.get("1.3.6.1.2.1.2.2.1.10." + str(if_index))
             out_oct = cli.get("1.3.6.1.2.1.2.2.1.16." + str(if_index))
+            counter_bits = 32
         except SNMPError as e:
             return "down", None, "SNMP GET failed: " + str(e), None
 
@@ -776,47 +803,58 @@ def check_snmp_traffic(sensor_row):
         conn.close()
 
     now = datetime.now()
+    observed_at = now.isoformat(timespec="microseconds")
     in_mbps = out_mbps = None
+    rate_note = None
+    dt = None
     if last and last["meta"]:
         try:
             meta_old = json.loads(last["meta"])
             last_in = meta_old.get("in_octets")
             last_out = meta_old.get("out_octets")
-            ts = last["timestamp"]
-            if isinstance(ts, str):
-                lt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            if meta_old.get("counter_bits") != counter_bits:
+                rate_note = "Counter type changed; collecting a new baseline"
             else:
-                lt = ts
-            dt = (now - lt).total_seconds()
-            if dt > 0 and last_in is not None and last_out is not None:
-                d_in = in_oct - last_in
-                d_out = out_oct - last_out
-                if in_oct < 2 ** 32 and d_in < 0:
-                    d_in += 2 ** 32
-                if out_oct < 2 ** 32 and d_out < 0:
-                    d_out += 2 ** 32
-                in_mbps = (d_in * 8) / dt / 1_000_000
-                out_mbps = (d_out * 8) / dt / 1_000_000
+                previous_at = meta_old.get("observed_at")
+                if previous_at:
+                    lt = datetime.fromisoformat(previous_at)
+                else:
+                    ts = last["timestamp"]
+                    lt = (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                          if isinstance(ts, str) else ts)
+                dt = (now - lt).total_seconds()
+                if dt > 0 and last_in is not None and last_out is not None:
+                    d_in = _counter_delta(int(in_oct), int(last_in), counter_bits)
+                    d_out = _counter_delta(int(out_oct), int(last_out), counter_bits)
+                    if d_in is not None and d_out is not None:
+                        in_mbps = (d_in * 8) / dt / 1_000_000
+                        out_mbps = (d_out * 8) / dt / 1_000_000
+                    else:
+                        rate_note = "Counter reset detected; collecting a new baseline"
         except (ValueError, KeyError, TypeError):
-            pass
+            rate_note = "Counter baseline unavailable; collecting a new baseline"
 
+    elapsed_seconds = round(dt, 6) if dt is not None else None
     meta = json.dumps({
         "in_octets": in_oct, "out_octets": out_oct,
         "if_index": if_index, "oper_status": oper_str,
+        "counter_bits": counter_bits, "observed_at": observed_at,
         "in_mbps": in_mbps, "out_mbps": out_mbps,
+        "elapsed_seconds": elapsed_seconds,
         "capacity_mbps": params.get("capacity_mbps"),
         "in_utilization_pct": (
-            round(in_mbps * 100 / float(params["capacity_mbps"]), 2)
+            round(in_mbps * 100 / float(params["capacity_mbps"]), 4)
             if in_mbps is not None and params.get("capacity_mbps") else None
         ),
         "out_utilization_pct": (
-            round(out_mbps * 100 / float(params["capacity_mbps"]), 2)
+            round(out_mbps * 100 / float(params["capacity_mbps"]), 4)
             if out_mbps is not None and params.get("capacity_mbps") else None
         ),
     })
 
     if in_mbps is None:
-        return "up", None, "Baseline (in=" + str(in_oct) + " B, out=" + str(out_oct) + " B)", meta
+        message = rate_note or "Baseline (in=" + str(in_oct) + " B, out=" + str(out_oct) + " B)"
+        return "up", None, message, meta
 
     peak = max(in_mbps, out_mbps or 0)
     warn = sensor_row["warning_latency_ms"]
@@ -826,8 +864,13 @@ def check_snmp_traffic(sensor_row):
         status = "warning"
     if err and peak >= err:
         status = "down"
-    msg = "IN %.2f Mbps | OUT %.2f Mbps | oper=%s" % (in_mbps, out_mbps, oper_str)
-    return status, round(in_mbps, 3), msg, meta
+    if in_mbps == 0 and out_mbps == 0:
+        msg = "No counter increase during the last poll | oper=%s" % oper_str
+    else:
+        msg = "IN %s | OUT %s | oper=%s" % (
+            _format_traffic_rate(in_mbps), _format_traffic_rate(out_mbps), oper_str,
+        )
+    return status, round(in_mbps, 6), msg, meta
 
 
 def check_snmp_storage(sensor_row):
@@ -1790,7 +1833,9 @@ SENSOR_DETAIL_HTML = """
 <table><thead><tr><th>Timestamp</th><th>Status</th><th>Value</th><th>Message</th></tr></thead><tbody id="recentChecks">
 {% for r in recent %}<tr><td>{{ r.timestamp }}</td>
 <td><span class="badge {{ r.status }}">{{ r.status|upper }}</span></td>
-<td>{% if r.latency_ms is not none %}{{ '%.1f'|format(r.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% elif sensor.sensor_type == 'snmp_traffic' %} Mbps{% else %} ms{% endif %}{% else %}-{% endif %}</td>
+<td>{% if sensor.sensor_type == 'snmp_traffic' %}
+IN {{ r.value_in|traffic_rate }} / OUT {{ r.value_out|traffic_rate }}
+{% elif r.latency_ms is not none %}{{ '%.1f'|format(r.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% else %} ms{% endif %}{% else %}-{% endif %}</td>
 <td>{{ r.message }}</td></tr>{% endfor %}
 </tbody></table></div>
 <script>
@@ -1819,21 +1864,30 @@ async function loadChart(){
         updateRecent(data.recent||[]);
         if(!window.Chart){showChartMessage('Chart library did not load. Check your internet/CDN access and reload.');return;}
         const isTraffic=sensorType==='snmp_traffic';
+        const peakRate=isTraffic?Math.max(0,...data.in_values,...data.out_values):0;
+        const trafficScale=isTraffic&&peakRate>0&&peakRate<1?1000:1;
+        const chartUnit=isTraffic?(trafficScale===1000?'Kbps':'Mbps'):sensorUnit;
+        const inSeries=data.in_values.map(value=>value===null?null:value*trafficScale);
+        const outSeries=data.out_values.map(value=>value===null?null:value*trafficScale);
         const datasets=isTraffic?[
-            {label:'IN (Mbps)',data:data.in_values,borderColor:'#0a66c2',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false},
-            {label:'OUT (Mbps)',data:data.out_values,borderColor:'#6f42c1',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}
+            {label:'IN ('+chartUnit+')',data:inSeries,borderColor:'#0a66c2',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false},
+            {label:'OUT ('+chartUnit+')',data:outSeries,borderColor:'#6f42c1',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}
         ]:[{label:sensorUnit==='%'?'Used (%)':'Latency ('+sensorUnit+')',data:data.values,borderColor:'#0a66c2',
             backgroundColor:'rgba(10,102,194,.15)',fill:true,tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}];
         if(chart){
             chart.data.labels=data.labels;
-            datasets.forEach(function(dataset,index){chart.data.datasets[index].data=dataset.data;});
+            datasets.forEach(function(dataset,index){
+                chart.data.datasets[index].data=dataset.data;
+                chart.data.datasets[index].label=dataset.label;
+            });
+            chart.options.scales.y.title.text=chartUnit;
             chart.update('none');
         }else{
             chart=new Chart(document.getElementById('chart').getContext('2d'),{
                 type:'line',data:{labels:data.labels,datasets:datasets},
                 options:{responsive:true,maintainAspectRatio:false,animation:false,
                     interaction:{mode:'index',intersect:false},
-                    scales:{y:{beginAtZero:true,title:{display:true,text:sensorUnit}},
+                    scales:{y:{beginAtZero:true,title:{display:true,text:chartUnit}},
                         x:{ticks:{maxTicksLimit:12}}},plugins:{legend:{display:isTraffic}}}
             });
         }
@@ -1855,8 +1909,18 @@ function updateLatest(latest){
     const status=latest.status||'paused';
     const badge=document.getElementById('sensorStatus');
     badge.classList.remove(...statusClasses);badge.classList.add(status);badge.textContent=status.toUpperCase();
-    const details=latest.value===null||latest.value===undefined?'':(' — '+formatValue(latest.value));
+    let details='';
+    if(sensorType==='snmp_traffic'&&latest.value_in!==null&&latest.value_out!==null){
+        details=' — IN '+formatTrafficRate(latest.value_in)+' / OUT '+formatTrafficRate(latest.value_out);
+    }else if(latest.value!==null&&latest.value!==undefined){details=' — '+formatValue(latest.value);}
     document.getElementById('lastCheck').textContent='Last check: '+latest.timestamp+details+' — '+(latest.message||'');
+}
+
+function formatTrafficRate(value){
+    const rate=Number(value);
+    if(rate===0)return '0 bps';
+    if(rate>0&&rate<0.001)return (rate*1000000).toFixed(2)+' bps';
+    return rate>0&&rate<1?(rate*1000).toFixed(3)+' Kbps':rate.toFixed(4)+' Mbps';
 }
 
 function updateRecent(rows){
@@ -1867,7 +1931,10 @@ function updateRecent(rows){
         const timestamp=document.createElement('td');timestamp.textContent=row.timestamp||'';
         const statusCell=document.createElement('td');
         const badge=document.createElement('span');badge.className='badge '+(row.status||'paused');badge.textContent=(row.status||'paused').toUpperCase();statusCell.appendChild(badge);
-        const value=document.createElement('td');value.textContent=formatValue(row.value);
+        const value=document.createElement('td');
+        value.textContent=sensorType==='snmp_traffic'&&row.value_in!==null&&row.value_out!==null
+            ?'IN '+formatTrafficRate(row.value_in)+' / OUT '+formatTrafficRate(row.value_out)
+            :formatValue(row.value);
         const message=document.createElement('td');message.textContent=row.message||'';
         tr.append(timestamp,statusCell,value,message);body.appendChild(tr);
     });
@@ -1932,7 +1999,7 @@ def api_series(sid):
             "WHERE sensor_id = ? AND timestamp >= ? ORDER BY timestamp",
             (sid, cutoff)).fetchall()
         recent_rows = conn.execute(
-            "SELECT timestamp, status, latency_ms, message FROM sensor_data "
+            "SELECT timestamp, status, latency_ms, value_in, value_out, message FROM sensor_data "
             "WHERE sensor_id = ? ORDER BY id DESC LIMIT 100", (sid,),
         ).fetchall()
     finally:
@@ -1942,14 +2009,14 @@ def api_series(sid):
     labels, values, in_values, out_values = [], [], [], []
     for i in range(0, len(rows), step):
         chunk = rows[i:i + step]
-        def average(key):
+        def average(key, precision=3):
             vals = [r[key] for r in chunk if r[key] is not None]
-            return round(sum(vals) / len(vals), 3) if vals else None
+            return round(sum(vals) / len(vals), precision) if vals else None
         ts = chunk[0]["timestamp"]
         labels.append(ts[11:16] if isinstance(ts, str) else ts.strftime("%H:%M"))
         values.append(average("latency_ms"))
-        in_values.append(average("value_in"))
-        out_values.append(average("value_out"))
+        in_values.append(average("value_in", 6))
+        out_values.append(average("value_out", 6))
     latest = None
     if recent_rows:
         row = recent_rows[0]
@@ -1965,6 +2032,7 @@ def api_series(sid):
         latest = {
             "timestamp": timestamp if isinstance(timestamp, str) else timestamp.isoformat(sep=" ", timespec="seconds"),
             "status": "paused" if paused else row["status"], "value": row["latency_ms"],
+            "value_in": row["value_in"], "value_out": row["value_out"],
             "message": row["message"],
         }
     recent = []
@@ -1973,6 +2041,7 @@ def api_series(sid):
         recent.append({
             "timestamp": timestamp if isinstance(timestamp, str) else timestamp.isoformat(sep=" ", timespec="seconds"),
             "status": row["status"], "value": row["latency_ms"],
+            "value_in": row["value_in"], "value_out": row["value_out"],
             "message": row["message"],
         })
     response = jsonify({"labels": labels, "values": values,
@@ -2781,12 +2850,12 @@ TRAFFIC_HTML = """
 <div style="display:flex;gap:14px;font-weight:800">
 <div><div style="font-size:10px;color:#5b6b7b">IN</div>
 <div style="color:#0a66c2">
-<span id="traffic-in-{{ r.id }}">{{ '%.2f'|format(r.v_in) if r.v_in is not none else '—' }}</span>
-<span style="font-size:11px">Mbps</span></div></div>
+<span id="traffic-in-{{ r.id }}">{{ r.v_in|traffic_rate }}</span>
+<span style="font-size:11px"></span></div></div>
 <div><div style="font-size:10px;color:#5b6b7b">OUT</div>
 <div style="color:#6f42c1">
-<span id="traffic-out-{{ r.id }}">{{ '%.2f'|format(r.v_out) if r.v_out is not none else '—' }}</span>
-<span style="font-size:11px">Mbps</span></div></div>
+<span id="traffic-out-{{ r.id }}">{{ r.v_out|traffic_rate }}</span>
+<span style="font-size:11px"></span></div></div>
 <div><div style="font-size:10px;color:#5b6b7b">LINK UTIL.</div>
 <div style="color:#0f766e"><span id="traffic-util-{{ r.id }}">—</span>
 <span style="font-size:11px">%</span></div></div>
@@ -2808,6 +2877,10 @@ TRAFFIC_HTML = """
 → Interfaces → Add monitoring.</div>
 {% endif %}
 <script>
+function formatTrafficRate(value){
+    const rate=Number(value);
+    return rate>0&&rate<1?(rate*1000).toFixed(2)+' Kbps':rate.toFixed(4)+' Mbps';
+}
 async function refreshTraffic(){
     try{
         const response=await fetch('/api/traffic',{cache:'no-store'});
@@ -2828,10 +2901,10 @@ async function refreshTraffic(){
                 const inEl=document.getElementById('traffic-in-'+s.id);
                 const outEl=document.getElementById('traffic-out-'+s.id);
                 const utilEl=document.getElementById('traffic-util-'+s.id);
-                if(inEl)inEl.textContent=s.value_in==null?'—':Number(s.value_in).toFixed(2);
-                if(outEl)outEl.textContent=s.value_out==null?'—':Number(s.value_out).toFixed(2);
+                if(inEl)inEl.textContent=s.value_in==null?'—':formatTrafficRate(s.value_in);
+                if(outEl)outEl.textContent=s.value_out==null?'—':formatTrafficRate(s.value_out);
                 if(utilEl)utilEl.textContent=s.meta&&s.meta.capacity_mbps
-                    ?Math.max(s.meta.in_utilization_pct||0,s.meta.out_utilization_pct||0).toFixed(1):'—';
+                    ?Math.max(s.meta.in_utilization_pct||0,s.meta.out_utilization_pct||0).toFixed(4):'—';
             }
             if(s.sensor_type==='snmp_storage'){
                 const utilEl=document.getElementById('storage-util-'+s.id);
