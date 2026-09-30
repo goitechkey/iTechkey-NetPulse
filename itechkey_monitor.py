@@ -1585,7 +1585,7 @@ HELP_HTML = """
 </section>
 <section class="card help-section" id="sensors" data-help>
 <h2>Sensors & history</h2><p>Create and edit checks in <a href="{{ url_for('sensors_page') }}">Sensors</a>. Available sensor types include Ping, TCP, HTTP, HTTPS, SNMP traffic, SNMP interface status, SNMP storage, and supported firewall health. Each sensor has its own interval, timeout, retry count, thresholds, and enabled state.</p>
-<p>Open a sensor to view recent checks and a historical chart. Traffic history plots inbound and outbound Mbps; storage history plots used percent. Configure warning/error thresholds in the sensor’s units shown by the editor.</p>
+<p>Open a sensor to view recent checks and a historical chart. The detail report refreshes stored samples every 10 seconds; new measurements only appear after the next collector poll. Traffic history plots inbound and outbound Mbps; storage history plots used percent. Configure warning/error thresholds in the sensor’s units shown by the editor.</p>
 </section>
 <section class="card help-section" id="traffic" data-help>
 <h2>Live Traffic view</h2><p>The <a href="{{ url_for('traffic_dashboard') }}">Traffic</a> page shows SNMP traffic, interface status, firewall health, and storage sensor cards. The browser refreshes displayed readings every 10 seconds; this is a UI refresh, not a guarantee of 10-second polling. Actual collection follows each sensor’s interval.</p>
@@ -1764,55 +1764,117 @@ SENSOR_DETAIL_HTML = """
       style="display:inline" onsubmit="return confirm('Delete?')">
 <button class="btn red">Delete</button></form></div>
 <div class="card">
-<h1>{{ sensor.name }} <span class="badge {{ status }}">{{ status|upper }}</span></h1>
+<h1>{{ sensor.name }} <span id="sensorStatus" class="badge {{ status }}">{{ status|upper }}</span></h1>
 <div style="color:#5b6b7b;font-size:13px">
 <b>Device:</b> {{ device.name }} ({{ device.host }}) &nbsp;|&nbsp;
 <b>Group:</b> {{ group.name if group else '—' }} &nbsp;|&nbsp;
 <b>Type:</b> {{ sensor.sensor_type }} &nbsp;|&nbsp;
-<b>Interval:</b> {{ sensor.interval_seconds }}s</div>
-{% if last %}<div style="margin-top:12px;font-size:14px">
-<b>Last check:</b> {{ last.timestamp }} —
-{% if last.latency_ms is not none %}<b>{{ '%.1f'|format(last.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% elif sensor.sensor_type == 'snmp_traffic' %} Mbps{% else %} ms{% endif %}</b>{% endif %}
-— {{ last.message }}</div>{% endif %}
+<b>Poll interval:</b> {{ sensor.interval_seconds }}s</div>
+<div id="lastCheck" style="margin-top:12px;font-size:14px" aria-live="polite">
+{% if last %}<b>Last check:</b> {{ last.timestamp }} — {{ last.message }}{% else %}Waiting for the first sensor check…{% endif %}
+</div>
 </div>
 <div class="card">
 <div class="toolbar" style="margin-bottom:6px">
 <h2 style="margin:0">{% if sensor.sensor_type == 'snmp_traffic' %}Traffic History{% elif sensor.sensor_type == 'snmp_storage' %}Storage Utilization History{% else %}Latency History{% endif %}</h2><span class="spacer"></span>
+<span style="font-size:12px;color:#6c757d">Auto-refresh 10s · sensor polls every {{ sensor.interval_seconds }}s</span>
 <select id="rangeSel" onchange="loadChart()">
 <option value="24">Last 24 hours</option>
 <option value="168">Last 7 days</option>
 <option value="720">Last 30 days</option>
 </select></div>
+{% if sensor.sensor_type == 'snmp_traffic' %}<div style="margin:8px 0;padding:11px 13px;border-left:4px solid #0a66c2;background:#eef6ff;border-radius:5px;color:#29415c;font-size:13px">Traffic rates require two successful counter samples. The first poll records a baseline; the first Mbps reading appears after the next poll.</div>{% endif %}
+<div id="chartMessage" role="status" style="display:none;color:#6c757d;padding:12px 0"></div>
 <div class="chart-box"><canvas id="chart"></canvas></div></div>
 <div class="card"><h2>Recent Checks (latest 100)</h2>
-<table><tr><th>Timestamp</th><th>Status</th><th>Value</th><th>Message</th></tr>
+<table><thead><tr><th>Timestamp</th><th>Status</th><th>Value</th><th>Message</th></tr></thead><tbody id="recentChecks">
 {% for r in recent %}<tr><td>{{ r.timestamp }}</td>
 <td><span class="badge {{ r.status }}">{{ r.status|upper }}</span></td>
 <td>{% if r.latency_ms is not none %}{{ '%.1f'|format(r.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% elif sensor.sensor_type == 'snmp_traffic' %} Mbps{% else %} ms{% endif %}{% else %}-{% endif %}</td>
-<td>{{ r.message }}</td></tr>{% endfor %}</table></div>
+<td>{{ r.message }}</td></tr>{% endfor %}
+</tbody></table></div>
 <script>
 let chart;
-async function loadChart(){
-  const h = document.getElementById('rangeSel').value;
-  const res = await fetch('/api/sensor/{{ sensor.id }}/series?hours='+h);
-  const data = await res.json();
-  const ctx = document.getElementById('chart').getContext('2d');
-  if (chart) chart.destroy();
-    const isTraffic='{{ sensor.sensor_type }}'==='snmp_traffic';
-    const unit='{{ sensor.sensor_type }}'==='snmp_storage'?'%':(isTraffic?'Mbps':'ms');
-    const datasets=isTraffic?[
-        {label:'IN (Mbps)',data:data.in_values,borderColor:'#0a66c2',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false},
-        {label:'OUT (Mbps)',data:data.out_values,borderColor:'#6f42c1',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}
-    ]:[{label:unit==='%'?'Used (%)':'Latency (ms)',data:data.values,borderColor:'#0a66c2',
-        backgroundColor:'rgba(10,102,194,.15)',fill:true,tension:.25,
-        pointRadius:0,borderWidth:2,spanGaps:false}];
-    chart = new Chart(ctx,{type:'line',data:{labels:data.labels,datasets:datasets},
-    options:{responsive:true,maintainAspectRatio:false,
-    interaction:{mode:'index',intersect:false},
-    scales:{y:{beginAtZero:true,title:{display:true,text:unit}},
-    x:{ticks:{maxTicksLimit:12}}},plugins:{legend:{display:isTraffic}}}});
+let chartLoading=false;
+const sensorType='{{ sensor.sensor_type }}';
+const sensorUnit=sensorType==='snmp_storage'?'%':(sensorType==='snmp_traffic'?'Mbps':'ms');
+const sensorId={{ sensor.id }};
+const statusClasses=['up','warning','down','paused'];
+
+function showChartMessage(message){
+    const element=document.getElementById('chartMessage');
+    element.textContent=message;
+    element.style.display=message?'block':'none';
 }
+
+async function loadChart(){
+    if(chartLoading)return;
+    chartLoading=true;
+    try{
+        const hours=document.getElementById('rangeSel').value;
+        const response=await fetch('/api/sensor/'+sensorId+'/series?hours='+hours+'&_='+Date.now(),{cache:'no-store'});
+        if(!response.ok)throw new Error('History request failed (HTTP '+response.status+')');
+        const data=await response.json();
+        updateLatest(data.latest);
+        updateRecent(data.recent||[]);
+        if(!window.Chart){showChartMessage('Chart library did not load. Check your internet/CDN access and reload.');return;}
+        const isTraffic=sensorType==='snmp_traffic';
+        const datasets=isTraffic?[
+            {label:'IN (Mbps)',data:data.in_values,borderColor:'#0a66c2',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false},
+            {label:'OUT (Mbps)',data:data.out_values,borderColor:'#6f42c1',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}
+        ]:[{label:sensorUnit==='%'?'Used (%)':'Latency ('+sensorUnit+')',data:data.values,borderColor:'#0a66c2',
+            backgroundColor:'rgba(10,102,194,.15)',fill:true,tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}];
+        if(chart){
+            chart.data.labels=data.labels;
+            datasets.forEach(function(dataset,index){chart.data.datasets[index].data=dataset.data;});
+            chart.update('none');
+        }else{
+            chart=new Chart(document.getElementById('chart').getContext('2d'),{
+                type:'line',data:{labels:data.labels,datasets:datasets},
+                options:{responsive:true,maintainAspectRatio:false,animation:false,
+                    interaction:{mode:'index',intersect:false},
+                    scales:{y:{beginAtZero:true,title:{display:true,text:sensorUnit}},
+                        x:{ticks:{maxTicksLimit:12}}},plugins:{legend:{display:isTraffic}}}
+            });
+        }
+        showChartMessage(data.labels.length?'':'No samples in this time range yet. Check that the collector is running and wait for the next sensor poll.');
+    }catch(error){
+        showChartMessage('Unable to refresh sensor report: '+error.message);
+    }finally{
+        chartLoading=false;
+    }
+}
+
+function formatValue(value){
+    if(value===null||value===undefined)return '—';
+    return Number(value).toFixed(1)+' '+sensorUnit;
+}
+
+function updateLatest(latest){
+    if(!latest)return;
+    const status=latest.status||'paused';
+    const badge=document.getElementById('sensorStatus');
+    badge.classList.remove(...statusClasses);badge.classList.add(status);badge.textContent=status.toUpperCase();
+    const details=latest.value===null||latest.value===undefined?'':(' — '+formatValue(latest.value));
+    document.getElementById('lastCheck').textContent='Last check: '+latest.timestamp+details+' — '+(latest.message||'');
+}
+
+function updateRecent(rows){
+    const body=document.getElementById('recentChecks');
+    body.replaceChildren();
+    rows.forEach(function(row){
+        const tr=document.createElement('tr');
+        const timestamp=document.createElement('td');timestamp.textContent=row.timestamp||'';
+        const statusCell=document.createElement('td');
+        const badge=document.createElement('span');badge.className='badge '+(row.status||'paused');badge.textContent=(row.status||'paused').toUpperCase();statusCell.appendChild(badge);
+        const value=document.createElement('td');value.textContent=formatValue(row.value);
+        const message=document.createElement('td');message.textContent=row.message||'';
+        tr.append(timestamp,statusCell,value,message);body.appendChild(tr);
+    });
+}
+
 loadChart();
+setInterval(loadChart,10000);
 </script>
 """
 
@@ -1860,10 +1922,19 @@ def api_series(sid):
     cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn = db()
     try:
+        sensor_state = conn.execute(
+            "SELECT enabled, paused_until FROM sensors WHERE id = ?", (sid,),
+        ).fetchone()
+        if not sensor_state:
+            abort(404)
         rows = conn.execute(
             "SELECT timestamp, latency_ms, value_in, value_out FROM sensor_data "
             "WHERE sensor_id = ? AND timestamp >= ? ORDER BY timestamp",
             (sid, cutoff)).fetchall()
+        recent_rows = conn.execute(
+            "SELECT timestamp, status, latency_ms, message FROM sensor_data "
+            "WHERE sensor_id = ? ORDER BY id DESC LIMIT 100", (sid,),
+        ).fetchall()
     finally:
         conn.close()
 
@@ -1879,8 +1950,36 @@ def api_series(sid):
         values.append(average("latency_ms"))
         in_values.append(average("value_in"))
         out_values.append(average("value_out"))
-    return jsonify({"labels": labels, "values": values,
-                    "in_values": in_values, "out_values": out_values})
+    latest = None
+    if recent_rows:
+        row = recent_rows[0]
+        timestamp = row["timestamp"]
+        paused = not sensor_state["enabled"]
+        if sensor_state["paused_until"]:
+            try:
+                paused = paused or datetime.fromisoformat(
+                    sensor_state["paused_until"]
+                ) > datetime.now()
+            except ValueError:
+                pass
+        latest = {
+            "timestamp": timestamp if isinstance(timestamp, str) else timestamp.isoformat(sep=" ", timespec="seconds"),
+            "status": "paused" if paused else row["status"], "value": row["latency_ms"],
+            "message": row["message"],
+        }
+    recent = []
+    for row in recent_rows:
+        timestamp = row["timestamp"]
+        recent.append({
+            "timestamp": timestamp if isinstance(timestamp, str) else timestamp.isoformat(sep=" ", timespec="seconds"),
+            "status": row["status"], "value": row["latency_ms"],
+            "message": row["message"],
+        })
+    response = jsonify({"labels": labels, "values": values,
+                        "in_values": in_values, "out_values": out_values,
+                        "latest": latest, "recent": recent})
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.route("/api/status")
