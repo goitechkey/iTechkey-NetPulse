@@ -865,7 +865,11 @@ def check_snmp_traffic(sensor_row):
     if err and peak >= err:
         status = "down"
     if in_mbps == 0 and out_mbps == 0:
-        msg = "No counter increase during the last poll | oper=%s" % oper_str
+        interface_name = params.get("if_name") or ("ifIndex " + str(if_index))
+        msg = (
+            "No counter increase on %s since last poll "
+            "(IN %s B, OUT %s B); verify this is the active WAN interface | oper=%s"
+        ) % (interface_name, in_oct, out_oct, oper_str)
     else:
         msg = "IN %s | OUT %s | oper=%s" % (
             _format_traffic_rate(in_mbps), _format_traffic_rate(out_mbps), oper_str,
@@ -1619,7 +1623,7 @@ HELP_HTML = """
 <h2>WAN internet & switch-port traffic</h2><p>From <a href="{{ url_for('devices') }}">Devices</a>, select a router/firewall/switch and open <b>Interfaces</b>. Discovery lists SNMP interfaces; select one or more and add traffic and/or status sensors.</p>
 <ul><li>Traffic uses cumulative byte counters and calculates inbound/outbound Mbps between polls. The first successful sample establishes a baseline; rates appear after a subsequent poll.</li>
 <li>Link utilization is calculated only when a link capacity is configured. For a WAN circuit, edit the traffic sensor and set <b>Link capacity (Mbps)</b> to the ISP plan speed if it differs from the reported port speed.</li>
-<li>Use the router/firewall’s actual internet-facing interface for WAN throughput. Traffic on a switch port is that port’s traffic, not automatically whole-internet usage.</li>
+<li>Use the router/firewall’s actual internet-facing interface for WAN throughput. If the sensor reports <b>No counter increase</b>, its selected interface counters did not change between polls; verify that the displayed interface name/ifIndex is the active WAN port. Traffic on a switch port is that port’s traffic, not automatically whole-internet usage.</li>
 <li>Choose a sensible polling interval; faster polling creates more SNMP requests and stored samples.</li></ul>
 </section>
 <section class="card help-section" id="storage" data-help>
@@ -1628,7 +1632,7 @@ HELP_HTML = """
 </section>
 <section class="card help-section" id="sensors" data-help>
 <h2>Sensors & history</h2><p>Create and edit checks in <a href="{{ url_for('sensors_page') }}">Sensors</a>. Available sensor types include Ping, TCP, HTTP, HTTPS, SNMP traffic, SNMP interface status, SNMP storage, and supported firewall health. Each sensor has its own interval, timeout, retry count, thresholds, and enabled state.</p>
-<p>Open a sensor to view recent checks and a historical chart. The detail report refreshes stored samples every 10 seconds; new measurements only appear after the next collector poll. Traffic history plots inbound and outbound Mbps; storage history plots used percent. Configure warning/error thresholds in the sensor’s units shown by the editor.</p>
+<p>Open a sensor to view recent checks and a historical chart. Select <b>Live · last 60 minutes</b>, 24 hours, 7 days, or 30 days. The detail report refreshes stored samples every 10 seconds; new measurements only appear after the next collector poll. Traffic history plots inbound and outbound rates; storage history plots used percent. Configure warning/error thresholds in the sensor’s units shown by the editor.</p>
 </section>
 <section class="card help-section" id="traffic" data-help>
 <h2>Live Traffic view</h2><p>The <a href="{{ url_for('traffic_dashboard') }}">Traffic</a> page shows SNMP traffic, interface status, firewall health, and storage sensor cards. The browser refreshes displayed readings every 10 seconds; this is a UI refresh, not a guarantee of 10-second polling. Actual collection follows each sensor’s interval.</p>
@@ -1822,11 +1826,12 @@ SENSOR_DETAIL_HTML = """
 <h2 style="margin:0">{% if sensor.sensor_type == 'snmp_traffic' %}Traffic History{% elif sensor.sensor_type == 'snmp_storage' %}Storage Utilization History{% else %}Latency History{% endif %}</h2><span class="spacer"></span>
 <span style="font-size:12px;color:#6c757d">Auto-refresh 10s · sensor polls every {{ sensor.interval_seconds }}s</span>
 <select id="rangeSel" onchange="loadChart()">
+<option value="1">Live · last 60 minutes</option>
 <option value="24">Last 24 hours</option>
 <option value="168">Last 7 days</option>
 <option value="720">Last 30 days</option>
 </select></div>
-{% if sensor.sensor_type == 'snmp_traffic' %}<div style="margin:8px 0;padding:11px 13px;border-left:4px solid #0a66c2;background:#eef6ff;border-radius:5px;color:#29415c;font-size:13px">Traffic rates require two successful counter samples. The first poll records a baseline; the first Mbps reading appears after the next poll.</div>{% endif %}
+{% if sensor.sensor_type == 'snmp_traffic' %}<div style="margin:8px 0;padding:11px 13px;border-left:4px solid #0a66c2;background:#eef6ff;border-radius:5px;color:#29415c;font-size:13px">Live shows the last 60 minutes and refreshes every 10 seconds. New rates arrive only on the sensor poll interval ({{ sensor.interval_seconds }}s). The first poll records a byte-counter baseline; rates appear after a later poll changes those counters.</div>{% endif %}
 <div id="chartMessage" role="status" style="display:none;color:#6c757d;padding:12px 0"></div>
 <div class="chart-box"><canvas id="chart"></canvas></div></div>
 <div class="card"><h2>Recent Checks (latest 100)</h2>
@@ -1891,7 +1896,19 @@ async function loadChart(){
                         x:{ticks:{maxTicksLimit:12}}},plugins:{legend:{display:isTraffic}}}
             });
         }
-        showChartMessage(data.labels.length?'':'No samples in this time range yet. Check that the collector is running and wait for the next sensor poll.');
+        const hasValues=isTraffic
+            ?data.in_values.some(value=>value!==null)||data.out_values.some(value=>value!==null)
+            :data.values.some(value=>value!==null);
+        if(!data.labels.length){
+            showChartMessage('No samples in this time range yet. Check that the collector is running and wait for the next sensor poll.');
+        }else if(isTraffic&&!hasValues){
+            const latestMessage=data.latest&&data.latest.message||'';
+            showChartMessage(latestMessage.indexOf('Baseline')>=0
+                ?'Counter baseline recorded; waiting for the next successful poll to calculate traffic speed.'
+                :'No traffic-rate samples in this range yet. Check the selected interface and wait for another poll.');
+        }else{
+            showChartMessage('');
+        }
     }catch(error){
         showChartMessage('Unable to refresh sensor report: '+error.message);
     }finally{
@@ -2013,7 +2030,15 @@ def api_series(sid):
             vals = [r[key] for r in chunk if r[key] is not None]
             return round(sum(vals) / len(vals), precision) if vals else None
         ts = chunk[0]["timestamp"]
-        labels.append(ts[11:16] if isinstance(ts, str) else ts.strftime("%H:%M"))
+        if isinstance(ts, str):
+            label = ts[11:19] if hours <= 1 else (
+                ts[5:16] if hours > 24 else ts[11:16]
+            )
+        else:
+            label = ts.strftime("%H:%M:%S" if hours <= 1 else (
+                "%m-%d %H:%M" if hours > 24 else "%H:%M"
+            ))
+        labels.append(label)
         values.append(average("latency_ms"))
         in_values.append(average("value_in", 6))
         out_values.append(average("value_out", 6))
