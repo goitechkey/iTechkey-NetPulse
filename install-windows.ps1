@@ -203,19 +203,33 @@ if (Test-Path ".env") {
 # ---- Step 5: Firewall rule (optional) ----
 Write-Head "Firewall configuration (optional)"
 
-foreach ($port in @($HttpPort, $HttpsPort)) {
-    $ruleName = "iTechkey NetPulse (Port $port)"
-    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-    if ($existing) {
-        Write-OK "Firewall rule already exists for port $port"
-    } else {
-        try {
-            New-NetFirewallRule -DisplayName $ruleName `
-                -Direction Inbound -Protocol TCP -LocalPort $port `
-                -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-            Write-OK "Firewall rule added for port $port"
-        } catch {
-            Write-Warn "Could not add firewall rule for port $port (non-fatal)"
+$bindHost = "127.0.0.1"
+if (Test-Path ".env") {
+    foreach ($line in Get-Content ".env") {
+        if ($line -match '^\s*ITECHKEY_BIND_HOST\s*=\s*(.+?)\s*$') {
+            $bindHost = $Matches[1]
+        }
+    }
+}
+$isLocalOnly = $bindHost -in @("127.0.0.1", "::1", "localhost")
+
+if ($isLocalOnly) {
+    Write-Info "No inbound firewall rule added: NetPulse is configured for local-only access."
+} else {
+    foreach ($port in @($HttpPort, $HttpsPort)) {
+        $ruleName = "iTechkey NetPulse (Port $port)"
+        $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-OK "Firewall rule already exists for port $port"
+        } else {
+            try {
+                New-NetFirewallRule -DisplayName $ruleName `
+                    -Direction Inbound -Protocol TCP -LocalPort $port `
+                    -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                Write-OK "Firewall rule added for port $port"
+            } catch {
+                Write-Warn "Could not add firewall rule for port $port (non-fatal)"
+            }
         }
     }
 }
@@ -282,7 +296,11 @@ Write-Host ""
 Write-Host "    Local URL      : " -NoNewline
 Write-Host "http://localhost" -ForegroundColor Cyan
 Write-Host "    Network URL    : " -NoNewline
-Write-Host "http://${lanIP}" -ForegroundColor Cyan
+if ($isLocalOnly) {
+    Write-Host "disabled (configure TLS and ITECHKEY_BIND_HOST for remote access)" -ForegroundColor Yellow
+} else {
+    Write-Host "http://${lanIP}" -ForegroundColor Cyan
+}
 Write-Host "    HTTPS URL      : " -NoNewline
 Write-Host "https://${lanIP} (requires TLS certificate configuration)" -ForegroundColor Cyan
 Write-Host "    Login          : " -NoNewline

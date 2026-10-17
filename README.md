@@ -52,7 +52,7 @@ In elevated PowerShell, use `Get-ScheduledTask -TaskName 'iTechkey NetPulse Moni
 - **Thread pool**: 20 parallel monitor workers
 - **Batch inserts**: flush every 5s (500 rows max)
 - **Connection pool**: 30 connections (DBUtils)
-- **Monthly partitions**: easy retention (drop partition, no lock)
+- **Daily retention cleanup**: history is bounded by the configured retention period
 - **Materialized status cache**: fast dashboard for 1000+ sensors
 - **Gunicorn**: 4 workers × 8 threads for web UI
 
@@ -105,7 +105,7 @@ export $(cat .env | xargs)
 gunicorn -w 4 --threads 8 -b 127.0.0.1:5000 --timeout 120 itechkey_monitor:app
 ```
 
-When using Gunicorn, keep its backend bound to localhost (for example, `127.0.0.1:5000`) and configure a production reverse proxy such as Nginx, Caddy, Apache, or IIS to handle public ports 80/443 and TLS. Gunicorn does not use the direct-launch HTTP/HTTPS listener configuration above. Run exactly one collector process alongside the web workers:
+When using Gunicorn, keep its backend bound to localhost (for example, `127.0.0.1:5000`) and configure a production reverse proxy such as Nginx, Caddy, Apache, or IIS to handle public ports 80/443 and TLS. Set `ITECHKEY_SECURE_COOKIES=1` when that proxy terminates TLS, so session cookies are sent only over HTTPS. Gunicorn does not use the direct-launch HTTP/HTTPS listener configuration above. Run exactly one collector process alongside the web workers:
 
 ```bash
 python itechkey_collector.py
@@ -156,11 +156,10 @@ WantedBy=multi-user.target
 GET /health  → {status, sensors_enabled, last_data_seconds_ago}
 ```
 
-## Retention & Partitions
+## Retention
 
-- **Auto-partition**: monthly partitions for `sensor_data`
-- **Retention**: 6 months (configurable)
-- **Cleanup**: partition drop (instant) — no DELETE locks
+- **Retention**: 6 months (configurable in the application source)
+- **Cleanup**: a daily cleanup removes expired sensor history and notification logs
 
 ## Environment Variables (.env — auto-generated)
 
@@ -174,10 +173,17 @@ MYSQL_DB=itechkey_monitor
 MONITOR_WORKERS=20
 ITECHKEY_HTTP_PORT=80
 ITECHKEY_HTTPS_PORT=443
+ITECHKEY_BIND_HOST=127.0.0.1      # local-only unless TLS is configured
 # Configure both values to enable HTTPS; omit them for HTTP-only mode.
 ITECHKEY_SSL_CERT=/path/to/fullchain.pem
 ITECHKEY_SSL_KEY=/path/to/private-key.pem
+# Set this when HTTPS terminates at a reverse proxy instead of this app.
+ITECHKEY_SECURE_COOKIES=1
 ```
+
+For remote access, configure TLS and set `ITECHKEY_BIND_HOST=0.0.0.0` (or a
+specific LAN address). Remote HTTP without TLS is refused unless
+`ITECHKEY_ALLOW_INSECURE_REMOTE=1` is explicitly set for a trusted LAN.
 
 ## License
 

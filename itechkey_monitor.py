@@ -2,7 +2,7 @@
 iTechkey NetPulse - Network Monitoring System
 Version : 1.1.0
 Author  : iTechkey
-Contact : admin@itechkey.com
+Contact : info@itechkey.com
 """
 
 import os
@@ -15,12 +15,15 @@ import smtplib
 import threading
 import subprocess
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import hmac
+import secrets
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from io import BytesIO
 from email.message import EmailMessage
+from html import escape
 from urllib.parse import urlsplit, urlunsplit
 
 from flask import (
@@ -81,6 +84,15 @@ HTTP_PORT = int(os.environ.get("ITECHKEY_HTTP_PORT", 80))
 HTTPS_PORT = int(os.environ.get("ITECHKEY_HTTPS_PORT", 443))
 SSL_CERT_FILE = os.environ.get("ITECHKEY_SSL_CERT", "").strip()
 SSL_KEY_FILE = os.environ.get("ITECHKEY_SSL_KEY", "").strip()
+BIND_HOST = os.environ.get(
+    "ITECHKEY_BIND_HOST", "0.0.0.0" if SSL_CERT_FILE else "127.0.0.1"
+).strip()
+ALLOW_INSECURE_REMOTE = os.environ.get(
+    "ITECHKEY_ALLOW_INSECURE_REMOTE", "0"
+).strip().lower() in ("1", "true", "yes")
+SECURE_COOKIES = os.environ.get(
+    "ITECHKEY_SECURE_COOKIES", ""
+).strip().lower() in ("1", "true", "yes") or bool(SSL_CERT_FILE)
 DB_FILE = BASE_DIR / "itechkey.db"
 LOG_FILE = BASE_DIR / "itechkey.log"
 SECRET_FILE = BASE_DIR / "itechkey_secret.key"
@@ -114,6 +126,13 @@ logging.basicConfig(
 STATIC_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=SECURE_COOKIES,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
 
 if SECRET_FILE.exists():
     app.secret_key = SECRET_FILE.read_bytes()
@@ -121,6 +140,36 @@ else:
     _key = os.urandom(32)
     SECRET_FILE.write_bytes(_key)
     app.secret_key = _key
+
+
+def _csrf_token():
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return token
+
+
+@app.before_request
+def _check_csrf():
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    supplied = request.form.get("_csrf_token") or request.headers.get("X-CSRF-Token")
+    expected = session.get("_csrf_token")
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        abort(400, description="Invalid or missing form security token")
+    return None
+
+
+@app.after_request
+def _set_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
+
+
+app.jinja_env.globals["csrf_token"] = _csrf_token
 
 
 # ============================================================================
@@ -192,7 +241,9 @@ CREATE TABLE IF NOT EXISTS devices (
     name TEXT NOT NULL,
     host TEXT NOT NULL,
     tags TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE SET NULL,
+    FOREIGN KEY (snmp_cred_id) REFERENCES snmp_credentials(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS sensors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,7 +258,8 @@ CREATE TABLE IF NOT EXISTS sensors (
     paused_until TEXT,
     warning_latency_ms INTEGER,
     error_latency_ms INTEGER,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS sensor_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -218,7 +270,8 @@ CREATE TABLE IF NOT EXISTS sensor_data (
     message TEXT,
     value_in REAL,
     value_out REAL,
-    meta TEXT
+    meta TEXT,
+    FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_sd_sid_ts ON sensor_data(sensor_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_sd_ts ON sensor_data(timestamp);
@@ -232,7 +285,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     webhook_url TEXT,
     cooldown_minutes INTEGER DEFAULT 15,
     enabled INTEGER DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,7 +295,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     timestamp TEXT NOT NULL,
     subject TEXT,
     message TEXT,
-    status TEXT
+    status TEXT,
+    FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE,
+    FOREIGN KEY (rule_id) REFERENCES alert_rules(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -282,7 +338,11 @@ CREATE TABLE IF NOT EXISTS devices (
     host VARCHAR(150) NOT NULL,
     tags VARCHAR(255),
     created_at VARCHAR(32) NOT NULL,
-    INDEX idx_dev_group (group_id)
+    INDEX idx_dev_group (group_id),
+    CONSTRAINT fk_devices_group FOREIGN KEY (group_id)
+        REFERENCES groups(id) ON DELETE SET NULL,
+    CONSTRAINT fk_devices_cred FOREIGN KEY (snmp_cred_id)
+        REFERENCES snmp_credentials(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS sensors (
@@ -300,7 +360,9 @@ CREATE TABLE IF NOT EXISTS sensors (
     error_latency_ms INT,
     created_at VARCHAR(32) NOT NULL,
     INDEX idx_sensor_device (device_id),
-    INDEX idx_sensor_enabled (enabled, interval_seconds)
+    INDEX idx_sensor_enabled (enabled, interval_seconds),
+    CONSTRAINT fk_sensors_device FOREIGN KEY (device_id)
+        REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS sensor_data (
@@ -315,7 +377,9 @@ CREATE TABLE IF NOT EXISTS sensor_data (
     meta TEXT,
     INDEX idx_sd_sid_ts (sensor_id, timestamp),
     INDEX idx_sd_ts (timestamp),
-    INDEX idx_sd_status_ts (status, timestamp)
+    INDEX idx_sd_status_ts (status, timestamp),
+    CONSTRAINT fk_sensor_data_sensor FOREIGN KEY (sensor_id)
+        REFERENCES sensors(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS alert_rules (
@@ -329,7 +393,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     cooldown_minutes INT DEFAULT 15,
     enabled INT DEFAULT 1,
     created_at VARCHAR(32) NOT NULL,
-    INDEX idx_rule_enabled (enabled)
+    INDEX idx_rule_enabled (enabled),
+    CONSTRAINT fk_alert_rules_sensor FOREIGN KEY (sensor_id)
+        REFERENCES sensors(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -340,7 +406,11 @@ CREATE TABLE IF NOT EXISTS notifications (
     subject VARCHAR(500),
     message TEXT,
     status VARCHAR(100),
-    INDEX idx_notif_ts (timestamp)
+    INDEX idx_notif_ts (timestamp),
+    CONSTRAINT fk_notifications_sensor FOREIGN KEY (sensor_id)
+        REFERENCES sensors(id) ON DELETE CASCADE,
+    CONSTRAINT fk_notifications_rule FOREIGN KEY (rule_id)
+        REFERENCES alert_rules(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -461,6 +531,28 @@ def db():
     return _DB()
 
 
+def _delete_sensor_tree(conn, sensor_id):
+    """Delete a sensor and records that cannot be useful without it.
+
+    Older installations predate foreign keys, so routes use this explicit
+    cleanup as well as the cascading constraints in a newly created database.
+    """
+    conn.execute("DELETE FROM notifications WHERE sensor_id = ?", (sensor_id,))
+    conn.execute("DELETE FROM alert_rules WHERE sensor_id = ?", (sensor_id,))
+    conn.execute("DELETE FROM sensor_data WHERE sensor_id = ?", (sensor_id,))
+    conn.execute("DELETE FROM sensors WHERE id = ?", (sensor_id,))
+
+
+def _delete_device_tree(conn, device_id):
+    sensor_rows = conn.execute(
+        "SELECT id FROM sensors WHERE device_id = ?", (device_id,)
+    ).fetchall()
+    for sensor in sensor_rows:
+        _delete_sensor_tree(conn, sensor["id"])
+    conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+    return [sensor["id"] for sensor in sensor_rows]
+
+
 # ============================================================================
 # INIT DATABASE
 # ============================================================================
@@ -480,7 +572,8 @@ def init_db():
         _ensure_col("sensor_data", "meta", "TEXT")
 
     row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
-    if row and row["c"] == 0:
+    created_default_admin = bool(row and row["c"] == 0)
+    if created_default_admin:
         conn.execute(
             "INSERT INTO users (username, password_hash, created_at) "
             "VALUES (?, ?, ?)",
@@ -497,6 +590,8 @@ def init_db():
         "smtp_recipients": "",
         "email_enabled": "0",
     }
+    if created_default_admin:
+        defaults["force_password_change"] = "1"
     if DB_BACKEND == "mysql":
         sql_ins = "INSERT IGNORE INTO settings (`key`, value) VALUES (?, ?)"
     else:
@@ -542,11 +637,27 @@ def set_setting(key, value):
 # ============================================================================
 # PARTITIONS (MySQL only)
 # ============================================================================
+_partitioning_warning_logged = False
+
+
 def ensure_partitions():
+    global _partitioning_warning_logged
     if DB_BACKEND != "mysql":
-        return
+        return False
     conn = db()
     try:
+        pmax = conn.execute(
+            "SELECT PARTITION_NAME FROM information_schema.PARTITIONS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='sensor_data' "
+            "AND PARTITION_NAME='pmax'"
+        ).fetchone()
+        if not pmax:
+            if not _partitioning_warning_logged:
+                logging.warning(
+                    "sensor_data is not partitioned; using daily DELETE retention"
+                )
+                _partitioning_warning_logged = True
+            return False
         nxt = (datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1)
         nxt2 = (nxt + timedelta(days=32)).replace(day=1)
         pname = "p" + nxt.strftime("%Y%m")
@@ -566,19 +677,20 @@ def ensure_partitions():
                 logging.info("Created partition %s", pname)
             except Exception as e:
                 logging.warning("Partition create failed: %s", e)
+        return True
     finally:
         conn.close()
 
 
 def drop_old_partitions():
     if DB_BACKEND != "mysql":
-        return
+        return False
     conn = db()
     try:
         cutoff = datetime.now() - timedelta(days=RETENTION_MONTHS * 30)
         rows = conn.execute(
             "SELECT PARTITION_NAME FROM information_schema.PARTITIONS "
-            "WHERE TABLE_NAME='sensor_data' "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='sensor_data' "
             "AND PARTITION_NAME LIKE 'p%' "
             "AND PARTITION_NAME != 'pmax'"
         ).fetchall()
@@ -593,6 +705,7 @@ def drop_old_partitions():
                     conn.commit()
             except ValueError:
                 continue
+        return True
     finally:
         conn.close()
 
@@ -605,6 +718,10 @@ def login_required(f):
     def wrapper(*args, **kwargs):
         if not session.get("user"):
             return redirect(url_for("login", next=request.path))
+        if (get_setting("force_password_change", "0") == "1"
+                and request.endpoint not in ("settings_page", "change_password", "logout")):
+            flash("Change the initial administrator password before continuing.", "err")
+            return redirect(url_for("settings_page"))
         return f(*args, **kwargs)
     return wrapper
 
@@ -695,7 +812,6 @@ def check_dns(host, timeout, retries, warn, err):
     for _ in range(retries + 1):
         t0 = time.time()
         try:
-            socket.setdefaulttimeout(timeout)
             ip = socket.gethostbyname(host)
             latency = (time.time() - t0) * 1000
             return "up", latency, "Resolved to " + ip
@@ -722,7 +838,13 @@ def _sensor_device_ctx(sensor_row):
 def _snmp_for(dev, timeout=5, retries=1):
     if not dev or not dev["community"]:
         raise SNMPError("Device has no SNMP credentials attached")
-    ver = 1 if (dev["snmp_ver"] or "2c") == "2c" else 0
+    configured_version = str(dev["snmp_ver"] or "2c").lower()
+    if configured_version in ("2", "2c", "v2", "v2c"):
+        ver = 2
+    elif configured_version in ("1", "v1"):
+        ver = 1
+    else:
+        raise SNMPError("Unsupported SNMP version: " + configured_version)
     return SNMPClient(
         dev["host"], community=dev["community"], version=ver,
         port=dev["snmp_port"] or 161, timeout=timeout, retries=retries,
@@ -1045,6 +1167,7 @@ def run_sensor_check(sensor_row):
 # ALERT ENGINE
 # ============================================================================
 _last_alert = {}
+_alert_lock = threading.Lock()
 
 
 def _rule_matches(rule, status, latency, prev_status):
@@ -1088,11 +1211,12 @@ def process_alerts(sensor, status, latency, message, prev_status):
         if not _rule_matches(rule, status, latency, prev_status):
             continue
         key = (rule["id"], sensor["id"])
-        last = _last_alert.get(key)
-        cooldown = timedelta(minutes=rule["cooldown_minutes"] or 15)
-        if last and now - last < cooldown:
-            continue
-        _last_alert[key] = now
+        with _alert_lock:
+            last = _last_alert.get(key)
+            cooldown = timedelta(minutes=rule["cooldown_minutes"] or 15)
+            if last and now - last < cooldown:
+                continue
+            _last_alert[key] = now
 
         subject = "[%s] %s / %s / %s" % (
             status.upper(), grp_name, dev_name, sensor["name"])
@@ -1109,6 +1233,13 @@ def process_alerts(sensor, status, latency, message, prev_status):
         _deliver_notification(rule, sensor["id"], subject, body)
 
 
+def _process_alerts_safe(sensor, status, latency, message, prev_status):
+    try:
+        process_alerts(sensor, status, latency, message, prev_status)
+    except Exception:
+        logging.exception("Alert processing failed for sensor %s", sensor["id"])
+
+
 def _deliver_notification(rule, sensor_id, subject, body):
     flags = []
     if rule["notify_email"]:
@@ -1122,12 +1253,15 @@ def _deliver_notification(rule, sensor_id, subject, body):
     if rule["notify_webhook"] and rule["webhook_url"]:
         try:
             if _requests:
-                _requests.post(
+                response = _requests.post(
                     rule["webhook_url"],
                     json={"subject": subject, "body": body, "source": __app_name__},
                     timeout=10,
                 )
+                response.raise_for_status()
                 flags.append("webhook:sent")
+            else:
+                flags.append("webhook:failed(requests library not installed)")
         except Exception as e:
             flags.append("webhook:failed(%s)" % e)
 
@@ -1178,7 +1312,7 @@ def send_alert_email(subject, body):
         'padding-top:14px">' + __app_name__ + ' v' + __app_version__ + '</span>'
         '</div>'
         '<pre style="font-family:Consolas,monospace;font-size:13px;'
-        'white-space:pre-wrap">' + body + '</pre>'
+        'white-space:pre-wrap">' + escape(body) + '</pre>'
         '<p style="color:#adb5bd;font-size:11px;margin-top:24px;'
         'border-top:1px solid #e9ecef;padding-top:10px">'
         '© ' + str(datetime.now().year) + ' ' + __author__ + ' · ' +
@@ -1218,17 +1352,23 @@ def send_alert_email(subject, body):
 _monitor_stop = threading.Event()
 _data_queue = []
 _queue_lock = threading.Lock()
+_schedule_lock = threading.Lock()
+_last_poll_at = {}
+_last_status = {}
+_monitor_start_lock = threading.Lock()
+_monitor_started = False
 
 
 def _flush_batch():
     global _data_queue
     with _queue_lock:
         if not _data_queue:
-            return
+            return True
         batch = _data_queue
         _data_queue = []
-    conn = db()
+    conn = None
     try:
+        conn = db()
         conn.executemany(
             "INSERT INTO sensor_data "
             "(sensor_id, timestamp, status, latency_ms, message, "
@@ -1236,10 +1376,17 @@ def _flush_batch():
             batch,
         )
         conn.commit()
+        return True
     except Exception:
         logging.exception("Batch flush failed (%d rows)", len(batch))
+        # Do not discard samples during a temporary database outage.  Newer
+        # samples stay behind this batch so history remains ordered on retry.
+        with _queue_lock:
+            _data_queue = batch + _data_queue
+        return False
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def _poll_sensor(sensor):
@@ -1268,6 +1415,22 @@ def _poll_sensor(sensor):
     }
 
 
+def _parse_sensor_timestamp(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            try:
+                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+    return None
+
+
 def _sensor_due(sensor, now):
     if sensor["paused_until"]:
         try:
@@ -1276,79 +1439,122 @@ def _sensor_due(sensor, now):
         except ValueError:
             pass
 
-    conn = db()
-    try:
-        row = conn.execute(
-            "SELECT timestamp FROM sensor_data WHERE sensor_id = ? "
-            "ORDER BY id DESC LIMIT 1", (sensor["id"],),
-        ).fetchone()
-    finally:
-        conn.close()
-
     interval = max(5, sensor["interval_seconds"] or 60)
-    if not row:
+    with _schedule_lock:
+        last_poll = _last_poll_at.get(sensor["id"])
+        if last_poll is None:
+            last_poll = _parse_sensor_timestamp(sensor["last_timestamp"])
+            if last_poll is not None:
+                _last_poll_at[sensor["id"]] = last_poll
+    if last_poll is None:
         return True
 
-    ts = row["timestamp"]
-    if isinstance(ts, str):
-        try:
-            lt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return True
-    else:
-        lt = ts
-    return (now - lt).total_seconds() >= interval
+    return (now - last_poll).total_seconds() >= interval
 
 
-def _get_prev_status(sensor_id):
+def _mark_sensor_scheduled(sensor_id, when):
+    with _schedule_lock:
+        _last_poll_at[sensor_id] = when
+
+
+def _forget_sensor_schedule(sensor_id):
+    with _schedule_lock:
+        _last_poll_at.pop(sensor_id, None)
+        _last_status.pop(sensor_id, None)
+
+
+def _load_enabled_sensors():
     conn = db()
     try:
-        row = conn.execute(
-            "SELECT status FROM sensor_data WHERE sensor_id = ? "
-            "ORDER BY id DESC LIMIT 1", (sensor_id,),
-        ).fetchone()
-        return row["status"] if row else None
+        return conn.execute(
+            "SELECT s.*, d.name AS device_name, d.host AS device_host, "
+            "g.name AS group_name, last.timestamp AS last_timestamp, "
+            "last.status AS last_status "
+            "FROM sensors s "
+            "JOIN devices d ON d.id = s.device_id "
+            "LEFT JOIN groups g ON g.id = d.group_id "
+            "LEFT JOIN sensor_data last ON last.id = ("
+            " SELECT MAX(id) FROM sensor_data WHERE sensor_id = s.id) "
+            "WHERE s.enabled = 1"
+        ).fetchall()
     finally:
         conn.close()
+
+
+def _sync_schedule_state(sensors):
+    active_ids = {sensor["id"] for sensor in sensors}
+    with _schedule_lock:
+        for sensor_id in set(_last_poll_at) - active_ids:
+            _last_poll_at.pop(sensor_id, None)
+            _last_status.pop(sensor_id, None)
+        for sensor in sensors:
+            sensor_id = sensor["id"]
+            if sensor_id not in _last_poll_at:
+                last_poll = _parse_sensor_timestamp(sensor["last_timestamp"])
+                if last_poll is not None:
+                    _last_poll_at[sensor_id] = last_poll
+            if sensor_id not in _last_status and sensor["last_status"]:
+                _last_status[sensor_id] = sensor["last_status"]
 
 
 def monitor_loop():
+    global _monitor_started
     logging.info("%s v%s monitor started (workers=%d)",
                  __app_name__, __app_version__, MONITOR_WORKERS)
-    with ThreadPoolExecutor(max_workers=MONITOR_WORKERS,
-                            thread_name_prefix="poll") as pool:
-        while not _monitor_stop.is_set():
-            t0 = time.time()
-            now = datetime.now()
-
-            conn = db()
-            try:
-                sensors = conn.execute(
-                    "SELECT * FROM sensors WHERE enabled = 1"
-                ).fetchall()
-            finally:
-                conn.close()
-
-            due = [s for s in sensors if _sensor_due(s, now)]
-            if due:
-                futures = {pool.submit(_poll_sensor, s): s for s in due}
-                for fut in as_completed(futures):
+    in_flight = {}
+    try:
+        with ThreadPoolExecutor(max_workers=MONITOR_WORKERS,
+                                thread_name_prefix="poll") as pool, \
+                ThreadPoolExecutor(max_workers=max(1, min(4, MONITOR_WORKERS)),
+                                   thread_name_prefix="alert") as alert_pool:
+            while not _monitor_stop.is_set():
+                cycle_started = time.monotonic()
+                completed = 0
+                for future, sensor in list(in_flight.items()):
+                    if not future.done():
+                        continue
+                    del in_flight[future]
                     try:
-                        result = fut.result(timeout=60)
+                        result = future.result()
                         with _queue_lock:
                             _data_queue.append(result["row"])
-                        s = futures[fut]
-                        prev = _get_prev_status(s["id"])
-                        process_alerts(s, result["status"], result["latency"],
-                                       result["message"], prev)
+                        with _schedule_lock:
+                            previous_status = _last_status.get(sensor["id"])
+                            _last_status[sensor["id"]] = result["status"]
+                        alert_pool.submit(
+                            _process_alerts_safe, sensor, result["status"], result["latency"],
+                            result["message"], previous_status,
+                        )
+                        completed += 1
                     except Exception:
                         logging.exception("Poll future failed")
-                _flush_batch()
+                        _forget_sensor_schedule(sensor["id"])
 
-            duration = time.time() - t0
-            logging.info("Cycle: %d/%d polled in %.1fs",
-                         len(due), len(sensors), duration)
-            _monitor_stop.wait(max(1.0, 5.0 - duration))
+                if completed:
+                    _flush_batch()
+
+                sensors = _load_enabled_sensors()
+                _sync_schedule_state(sensors)
+                in_flight_ids = {sensor["id"] for sensor in in_flight.values()}
+                due = [sensor for sensor in sensors
+                       if sensor["id"] not in in_flight_ids
+                       and _sensor_due(sensor, datetime.now())]
+                for sensor in due:
+                    _mark_sensor_scheduled(sensor["id"], datetime.now())
+                    in_flight[pool.submit(_poll_sensor, sensor)] = sensor
+
+                if due or completed:
+                    logging.info("Scheduler: %d queued, %d completed, %d in flight",
+                                 len(due), completed, len(in_flight))
+                elapsed = time.monotonic() - cycle_started
+                _monitor_stop.wait(max(0.2, 1.0 - elapsed))
+    except Exception:
+        logging.exception("Monitor loop stopped unexpectedly")
+    finally:
+        _monitor_stop.set()
+        _flush_batch()
+        with _monitor_start_lock:
+            _monitor_started = False
 
 
 def batch_flush_loop():
@@ -1360,29 +1566,50 @@ def batch_flush_loop():
         _monitor_stop.wait(BATCH_FLUSH_SECONDS)
 
 
+def purge_expired_data(now=None):
+    now = now or datetime.now()
+    data_cutoff = (now - timedelta(days=RETENTION_MONTHS * 30)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    notification_cutoff = (now - timedelta(days=90)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    conn = db()
+    try:
+        conn.execute("DELETE FROM sensor_data WHERE timestamp < ?", (data_cutoff,))
+        conn.execute(
+            "DELETE FROM notifications WHERE timestamp < ?", (notification_cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def retention_loop():
     while not _monitor_stop.is_set():
         try:
             ensure_partitions()
             drop_old_partitions()
-            cutoff = (datetime.now() - timedelta(days=90)).strftime(
-                "%Y-%m-%d %H:%M:%S")
-            conn = db()
-            try:
-                conn.execute(
-                    "DELETE FROM notifications WHERE timestamp < ?", (cutoff,))
-                conn.commit()
-            finally:
-                conn.close()
+            purge_expired_data()
         except Exception:
             logging.exception("Retention error")
         _monitor_stop.wait(86400)
 
 
 def start_monitor():
-    threading.Thread(target=monitor_loop, name="monitor", daemon=True).start()
-    threading.Thread(target=batch_flush_loop, name="flusher", daemon=True).start()
-    threading.Thread(target=retention_loop, name="retention", daemon=True).start()
+    global _monitor_started
+    with _monitor_start_lock:
+        if _monitor_started:
+            logging.warning("Monitor start requested while it is already running")
+            return False
+        _monitor_started = True
+        _monitor_stop.clear()
+        threading.Thread(target=monitor_loop, name="monitor", daemon=True).start()
+        threading.Thread(target=batch_flush_loop, name="flusher", daemon=True).start()
+        threading.Thread(target=retention_loop, name="retention", daemon=True).start()
+    return True
+
+
+def stop_monitor():
+    _monitor_stop.set()
+    _flush_batch()
 
 
 # ============================================================================
@@ -1471,7 +1698,9 @@ footer b{color:var(--primary)}
 <span class="spacer"></span>
 <span class="user">👤 {{ session.user }}</span>
 <a href="{{ url_for('help_page') }}" class="help-link {{ 'active' if active=='help' }}" aria-label="Open NetPulse Help Center" title="Help & user guide"><span class="help-icon" aria-hidden="true">?</span><span>Help</span></a>
-<a href="{{ url_for('logout') }}">Logout</a>
+<form method="post" action="{{ url_for('logout') }}" style="margin:0">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<button class="btn small grey" type="submit">Logout</button></form>
 </nav>{% endif %}
 <div class="wrap">
 {% with msgs = get_flashed_messages(with_categories=true) %}
@@ -1506,6 +1735,7 @@ button{width:100%;padding:10px;background:#0a66c2;color:#fff;border:none;border-
 {% for m in msgs %}<div class="flash">{{ m }}</div>{% endfor %}
 {% endwith %}
 <form method="post">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <label>Username</label><input name="username" autofocus required>
 <label>Password</label><input name="password" type="password" required>
 <button type="submit">Sign in</button>
@@ -1526,6 +1756,15 @@ def _flash_redirect(url, msg, cat="ok"):
     return redirect(url)
 
 
+def _safe_next_url(target):
+    if not target:
+        return url_for("dashboard")
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or not target.startswith("/"):
+        return url_for("dashboard")
+    return target
+
+
 # ============================================================================
 # ROUTES — AUTH
 # ============================================================================
@@ -1542,13 +1781,19 @@ def login():
         finally:
             conn.close()
         if row and check_password_hash(row["password_hash"], password):
+            session.clear()
             session["user"] = username
-            return redirect(request.args.get("next") or url_for("dashboard"))
+            session.permanent = True
+            _csrf_token()
+            if username == "admin" and password == "admin":
+                set_setting("force_password_change", "1")
+            return redirect(_safe_next_url(request.args.get("next")))
         flash("Invalid credentials")
     return render_template_string(LOGIN_HTML)
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
+@login_required
 def logout():
     session.clear()
     return redirect(url_for("login"))
@@ -1806,9 +2051,20 @@ SENSOR_DETAIL_HTML = """
 <div class="toolbar">
 <a class="btn grey" href="{{ url_for('dashboard') }}">← Dashboard</a>
 <span class="spacer"></span>
+{% if sensor.paused_until %}
+<form method="post" action="{{ url_for('sensor_resume', sid=sensor.id) }}" style="display:inline">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<button class="btn green" type="submit">Resume</button></form>
+{% else %}
+<form method="post" action="{{ url_for('sensor_pause', sid=sensor.id) }}" style="display:inline">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="minutes" value="60">
+<button class="btn grey" type="submit">Pause 1 hour</button></form>
+{% endif %}
 <a class="btn" href="{{ url_for('sensor_edit', sid=sensor.id) }}">Edit</a>
 <form method="post" action="{{ url_for('sensor_delete', sid=sensor.id) }}"
       style="display:inline" onsubmit="return confirm('Delete?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red">Delete</button></form></div>
 <div class="card">
 <h1>{{ sensor.name }} <span id="sensorStatus" class="badge {{ status }}">{{ status|upper }}</span></h1>
@@ -2130,11 +2386,53 @@ def health():
 def sensor_delete(sid):
     conn = db()
     try:
-        conn.execute("DELETE FROM sensors WHERE id = ?", (sid,))
+        _delete_sensor_tree(conn, sid)
         conn.commit()
     finally:
         conn.close()
+    _forget_sensor_schedule(sid)
     return _flash_redirect(url_for("sensors_page"), "Sensor deleted")
+
+
+@app.route("/sensors/<int:sid>/pause", methods=["POST"])
+@login_required
+def sensor_pause(sid):
+    try:
+        minutes = max(1, min(7 * 24 * 60, int(request.form.get("minutes", 60))))
+    except ValueError:
+        return _flash_redirect(url_for("sensor_detail", sid=sid), "Invalid pause duration", "err")
+    paused_until = (datetime.now() + timedelta(minutes=minutes)).isoformat(
+        timespec="seconds")
+    conn = db()
+    try:
+        if not conn.execute("SELECT id FROM sensors WHERE id = ?", (sid,)).fetchone():
+            abort(404)
+        conn.execute(
+            "UPDATE sensors SET paused_until = ? WHERE id = ?", (paused_until, sid)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return _flash_redirect(
+        url_for("sensor_detail", sid=sid), "Sensor paused for %d minutes" % minutes
+    )
+
+
+@app.route("/sensors/<int:sid>/resume", methods=["POST"])
+@login_required
+def sensor_resume(sid):
+    conn = db()
+    try:
+        if not conn.execute("SELECT id FROM sensors WHERE id = ?", (sid,)).fetchone():
+            abort(404)
+        conn.execute(
+            "UPDATE sensors SET paused_until = NULL WHERE id = ?", (sid,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _forget_sensor_schedule(sid)
+    return _flash_redirect(url_for("sensor_detail", sid=sid), "Sensor resumed")
 
 
 # ============================================================================
@@ -2153,6 +2451,7 @@ DEVICES_HTML = """
 <td>{{ g.description or '' }}</td><td>{{ g.device_count }}</td>
 <td><form method="post" action="{{ url_for('group_delete', gid=g.id) }}"
 style="display:inline" onsubmit="return confirm('Delete?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red small">Delete</button></form></td></tr>
 {% endfor %}</table>{% else %}<p>No groups yet.</p>{% endif %}</div>
 <div class="card"><h2>Devices</h2>
@@ -2169,6 +2468,7 @@ style="display:inline" onsubmit="return confirm('Delete?')">
 <a class="btn small grey" href="{{ url_for('device_edit', did=d.id) }}">Edit</a>
 <form method="post" action="{{ url_for('device_delete', did=d.id) }}"
 style="display:inline" onsubmit="return confirm('Delete?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red small">Del</button></form>
 </td></tr>{% endfor %}</table>
 {% else %}<p>No devices yet.</p>{% endif %}</div>
@@ -2206,7 +2506,7 @@ volume availability and used percentage; generic SNMP cannot verify physical-dis
 {% if err %}<div class="flash err">{{ err }}</div>{% endif %}
 {% if not creds_ok %}<p>Attach SNMP credentials to this device before discovering storage.</p>
 {% elif storages %}
-<form method="post"><div class="row">
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="row">
 <div><label>Warning at (%)</label><input type="number" name="warning_pct" min="1" max="100" value="80"></div>
 <div><label>Critical at (%)</label><input type="number" name="critical_pct" min="1" max="100" value="90"></div>
 <div><label>Poll interval (seconds)</label><input type="number" name="interval" min="5" value="60"></div>
@@ -2305,7 +2605,7 @@ def device_storage(did):
 
 DEVICE_FORM_HTML = """
 <h1>{{ 'Edit' if device else 'Add' }} Device</h1>
-<form method="post"><div class="card">
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="card">
 <div class="row">
 <div><label>Group</label>
 <select name="group_id"><option value="">— none —</option>
@@ -2412,16 +2712,18 @@ def device_edit(did):
 def device_delete(did):
     conn = db()
     try:
-        conn.execute("DELETE FROM devices WHERE id = ?", (did,))
+        sensor_ids = _delete_device_tree(conn, did)
         conn.commit()
     finally:
         conn.close()
+    for sensor_id in sensor_ids:
+        _forget_sensor_schedule(sensor_id)
     return _flash_redirect(url_for("devices"), "Device deleted")
 
 
 GROUP_FORM_HTML = """
 <h1>Add Group</h1>
-<form method="post"><div class="card">
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="card">
 <div class="row">
 <div><label>Name</label><input name="name" required></div>
 <div><label>Description</label><input name="description"></div>
@@ -2482,6 +2784,7 @@ SNMP_CREDS_HTML = """
 <td>{{ r.port }}</td><td>{{ r.device_count }}</td>
 <td><form method="post" action="{{ url_for('snmp_creds_delete', cid=r.id) }}"
 style="display:inline" onsubmit="return confirm('Delete?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red small">Delete</button></form></td></tr>
 {% endfor %}</table>
 {% else %}<p>No credentials. <a href="{{ url_for('snmp_creds_new') }}">Add one</a>.</p>{% endif %}
@@ -2506,7 +2809,7 @@ def snmp_creds_page():
 
 SNMP_CRED_FORM_HTML = """
 <h1>Add SNMP Credential</h1>
-<form method="post"><div class="card">
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="card">
 <div class="row">
 <div><label>Name</label><input name="name" required></div>
 <div><label>Version</label>
@@ -2591,6 +2894,7 @@ INTERFACES_HTML = """
 {% if ifaces %}
 <form method="post" action="{{ url_for('device_interface_bulk_add', did=dev.id) }}"
       id="bulkForm">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <div class="card" style="background:#f8f9fb;border-left:5px solid var(--primary)">
 <h2 style="margin-top:0">⚡ Bulk Add Sensors</h2>
 <p style="color:#6c757d;font-size:13px;margin-bottom:12px">
@@ -3023,6 +3327,7 @@ SENSORS_HTML = """
 <td><a class="btn small grey" href="{{ url_for('sensor_edit', sid=s.id) }}">Edit</a>
 <form method="post" action="{{ url_for('sensor_delete', sid=s.id) }}"
 style="display:inline" onsubmit="return confirm('Delete?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red small">Del</button></form></td></tr>
 {% endfor %}</table>
 {% else %}<p>No sensors. <a href="{{ url_for('sensor_new') }}">Add one</a>.</p>{% endif %}
@@ -3047,7 +3352,7 @@ def sensors_page():
 
 SENSOR_FORM_HTML = """
 <h1>{{ 'Edit' if sensor else 'Add' }} Sensor</h1>
-<form method="post"><div class="card">
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="card">
 <div class="row">
 <div><label>Device</label>
 <select name="device_id" required><option value="">— select —</option>
@@ -3275,6 +3580,7 @@ ALERTS_HTML = """
 <td>{{ r.cooldown_minutes }}m</td>
 <td><form method="post" action="{{ url_for('alert_delete', rid=r.id) }}"
 style="display:inline" onsubmit="return confirm('Delete?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red small">Del</button></form></td></tr>
 {% endfor %}</table>
 {% else %}<p>No rules yet.</p>{% endif %}</div>
@@ -3298,7 +3604,7 @@ def alerts_page():
 
 ALERT_FORM_HTML = """
 <h1>Add Alert Rule</h1>
-<form method="post"><div class="card">
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="card">
 <div class="row">
 <div><label>Sensor (blank = ALL)</label>
 <select name="sensor_id"><option value="">All sensors</option>
@@ -3375,6 +3681,8 @@ def alert_new():
 def alert_delete(rid):
     conn = db()
     try:
+        # Existing databases may not yet have the FK that does this for us.
+        conn.execute("UPDATE notifications SET rule_id = NULL WHERE rule_id = ?", (rid,))
         conn.execute("DELETE FROM alert_rules WHERE id = ?", (rid,))
         conn.commit()
     finally:
@@ -3417,6 +3725,7 @@ SETTINGS_HTML = """
 <h1>Settings</h1>
 <div class="card"><h2>Email / SMTP</h2>
 <form method="post">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <div class="row">
 <div><label>SMTP host</label>
 <input name="smtp_host" value="{{ s.smtp_host }}"></div>
@@ -3431,7 +3740,8 @@ SETTINGS_HTML = """
 <div><label>Sender address</label>
 <input name="smtp_sender" value="{{ s.smtp_sender }}"></div>
 <div><label>Password / App password</label>
-<input name="smtp_password" type="password" value="{{ s.smtp_password }}"></div>
+<input name="smtp_password" type="password" value="" autocomplete="new-password"
+placeholder="Saved password; leave blank to keep it"></div>
 </div>
 <div class="row">
 <div style="flex:2"><label>Recipients (comma-separated)</label>
@@ -3448,6 +3758,7 @@ Gmail: use App Password (regular password won't work).</p>
 </div>
 <div class="card"><h2>Change Password</h2>
 <form method="post" action="{{ url_for('change_password') }}">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <div class="row">
 <div><label>Current</label>
 <input name="old_password" type="password" required></div>
@@ -3472,8 +3783,11 @@ Gmail: use App Password (regular password won't work).</p>
 def settings_page():
     if request.method == "POST":
         for k in ["smtp_host", "smtp_port", "smtp_security", "smtp_sender",
-                  "smtp_password", "smtp_recipients"]:
+                  "smtp_recipients"]:
             set_setting(k, request.form.get(k, ""))
+        smtp_password = request.form.get("smtp_password", "")
+        if smtp_password:
+            set_setting("smtp_password", smtp_password)
         set_setting("email_enabled",
                     "1" if request.form.get("email_enabled") else "0")
         if request.form.get("action") == "test":
@@ -3493,7 +3807,7 @@ def settings_page():
 
     s = {k: get_setting(k, "") for k in
          ["smtp_host", "smtp_port", "smtp_security", "smtp_sender",
-          "smtp_password", "smtp_recipients", "email_enabled"]}
+           "smtp_recipients", "email_enabled"]}
     body = render_template_string(
         SETTINGS_HTML, s=s, url_for=url_for,
         app_name=__app_name__, version=__app_version__,
@@ -3524,6 +3838,7 @@ def change_password():
         conn.commit()
     finally:
         conn.close()
+    set_setting("force_password_change", "0")
     return _flash_redirect(url_for("settings_page"), "Password updated", "ok")
 
 
@@ -3669,7 +3984,10 @@ def print_banner():
     http_suffix = "" if HTTP_PORT == 80 else ":%d" % HTTP_PORT
     https_suffix = "" if HTTPS_PORT == 443 else ":%d" % HTTPS_PORT
     print("  Local URL   : http://127.0.0.1%s" % http_suffix)
-    print("  Network URL : http://%s%s" % (ip, http_suffix))
+    if BIND_HOST not in ("127.0.0.1", "::1", "localhost"):
+        print("  Network URL : http://%s%s" % (ip, http_suffix))
+    else:
+        print("  Network URL : disabled (set ITECHKEY_BIND_HOST with TLS to allow remote access)")
     if SSL_CERT_FILE and SSL_KEY_FILE:
         print("  HTTPS URL   : https://127.0.0.1%s" % https_suffix)
         print("  Network TLS : https://%s%s" % (ip, https_suffix))
@@ -3692,6 +4010,14 @@ def run_web_servers():
         raise ValueError("HTTP and HTTPS ports must be different")
     if bool(SSL_CERT_FILE) != bool(SSL_KEY_FILE):
         raise ValueError("Set both ITECHKEY_SSL_CERT and ITECHKEY_SSL_KEY to enable HTTPS")
+    if not BIND_HOST:
+        raise ValueError("ITECHKEY_BIND_HOST cannot be empty")
+    if (not SSL_CERT_FILE and BIND_HOST not in ("127.0.0.1", "::1", "localhost")
+            and not ALLOW_INSECURE_REMOTE):
+        raise ValueError(
+            "Refusing remote HTTP without TLS. Configure HTTPS or explicitly set "
+            "ITECHKEY_ALLOW_INSECURE_REMOTE=1 for a trusted LAN."
+        )
 
     http_app = Flask(__name__ + "_http_redirect")
 
@@ -3713,10 +4039,10 @@ def run_web_servers():
         tls_context.load_cert_chain(SSL_CERT_FILE, SSL_KEY_FILE)
 
     http_server = make_server(
-        "0.0.0.0", HTTP_PORT, http_app if tls_context else app, threaded=True
+        BIND_HOST, HTTP_PORT, http_app if tls_context else app, threaded=True
     )
     https_server = (
-        make_server("0.0.0.0", HTTPS_PORT, app, threaded=True, ssl_context=tls_context)
+        make_server(BIND_HOST, HTTPS_PORT, app, threaded=True, ssl_context=tls_context)
         if tls_context else None
     )
 
@@ -3755,5 +4081,8 @@ if __name__ == "__main__":
         print("  → Re-run: python itechkey_setup.py")
         sys.exit(1)
     start_monitor()
-    print_banner()
-    run_web_servers()
+    try:
+        print_banner()
+        run_web_servers()
+    finally:
+        stop_monitor()

@@ -137,7 +137,10 @@ class SNMPClient:
                  timeout: float = 5.0, retries: int = 1):
         self.host = host
         self.community = community
-        self.version = 1 if version == 2 else 0
+        if version not in (1, 2):
+            raise ValueError("SNMP version must be 1 or 2")
+        # SNMP's BER protocol field is zero-based: v1=0, v2c=1.
+        self.version = version - 1
         self.port = int(port)
         self.timeout = timeout
         self.retries = retries

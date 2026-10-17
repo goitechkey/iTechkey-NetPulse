@@ -1,0 +1,280 @@
+import tempfile
+import unittest
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+import re
+
+import itechkey_monitor as monitor
+from itechkey_snmp import SNMPClient
+
+
+class ReliabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.original_db_file = monitor.DB_FILE
+        self.original_db_factory = monitor.db
+        self.temp_dir = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        monitor.DB_FILE = Path(self.temp_dir.name) / "test.db"
+        monitor._data_queue = []
+        monitor._last_poll_at.clear()
+        monitor._last_status.clear()
+        monitor.init_db()
+
+    def tearDown(self):
+        monitor.stop_monitor()
+        deadline = time.monotonic() + 3
+        while monitor._monitor_started and time.monotonic() < deadline:
+            time.sleep(0.02)
+        monitor.db = self.original_db_factory
+        monitor.DB_FILE = self.original_db_file
+        monitor._data_queue = []
+        monitor._last_poll_at.clear()
+        monitor._last_status.clear()
+        self.temp_dir.cleanup()
+
+    def _create_sensor(self):
+        conn = monitor.db()
+        try:
+            device_id = conn.execute(
+                "INSERT INTO devices (name, host, created_at) VALUES (?, ?, ?)",
+                ("router", "192.0.2.1", "2026-01-01T00:00:00"),
+            ).lastrowid
+            sensor_id = conn.execute(
+                "INSERT INTO sensors "
+                "(device_id, name, sensor_type, created_at) VALUES (?, ?, ?, ?)",
+                (device_id, "Ping router", "ping", "2026-01-01T00:00:00"),
+            ).lastrowid
+            conn.commit()
+            return device_id, sensor_id
+        finally:
+            conn.close()
+
+    def test_snmp_v2c_uses_the_v2c_wire_version(self):
+        client = monitor._snmp_for({
+            "community": "public", "snmp_ver": "2c",
+            "host": "192.0.2.1", "snmp_port": 161,
+        })
+        self.assertEqual(client.version, 1)  # BER encodes SNMP v2c as 1.
+        self.assertEqual(SNMPClient("192.0.2.1", version=1).version, 0)
+
+    def test_failed_batch_flush_keeps_samples_for_retry(self):
+        class FailingDB:
+            def executemany(self, *_args):
+                raise RuntimeError("database unavailable")
+
+            def close(self):
+                pass
+
+        row = (1, "2026-01-01 00:00:00", "up", 1.0, "ok", None, None, None)
+        monitor._data_queue = [row]
+        monitor.db = lambda: FailingDB()
+        self.assertFalse(monitor._flush_batch())
+        self.assertEqual(monitor._data_queue, [row])
+
+    def test_retention_removes_expired_sensor_history(self):
+        _, sensor_id = self._create_sensor()
+        conn = monitor.db()
+        try:
+            conn.executemany(
+                "INSERT INTO sensor_data "
+                "(sensor_id, timestamp, status, message) VALUES (?, ?, ?, ?)",
+                [
+                    (sensor_id, "2026-01-01 00:00:00", "up", "old"),
+                    (sensor_id, "2026-12-31 00:00:00", "up", "new"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monitor.purge_expired_data(datetime(2027, 1, 1))
+
+        conn = monitor.db()
+        try:
+            rows = conn.execute("SELECT message FROM sensor_data ORDER BY id").fetchall()
+            self.assertEqual([row["message"] for row in rows], ["new"])
+        finally:
+            conn.close()
+
+    def test_device_deletion_removes_its_sensor_tree(self):
+        device_id, sensor_id = self._create_sensor()
+        conn = monitor.db()
+        try:
+            conn.execute(
+                "INSERT INTO sensor_data (sensor_id, timestamp, status) VALUES (?, ?, ?)",
+                (sensor_id, "2026-01-01 00:00:00", "up"),
+            )
+            conn.execute(
+                "INSERT INTO alert_rules (sensor_id, condition, created_at) VALUES (?, ?, ?)",
+                (sensor_id, "down", "2026-01-01T00:00:00"),
+            )
+            conn.commit()
+            monitor._delete_device_tree(conn, device_id)
+            conn.commit()
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS c FROM sensors").fetchone()["c"], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS c FROM sensor_data").fetchone()["c"], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) AS c FROM alert_rules").fetchone()["c"], 0)
+        finally:
+            conn.close()
+
+    def test_alert_rule_deletion_preserves_notification_history_without_orphan(self):
+        _, sensor_id = self._create_sensor()
+        conn = monitor.db()
+        try:
+            rule_id = conn.execute(
+                "INSERT INTO alert_rules (sensor_id, condition, created_at) VALUES (?, ?, ?)",
+                (sensor_id, "down", "2026-01-01T00:00:00"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO notifications (sensor_id, rule_id, timestamp, status) "
+                "VALUES (?, ?, ?, ?)",
+                (sensor_id, rule_id, "2026-01-01 00:00:00", "sent"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+            state["_csrf_token"] = "test-token"
+        response = client.post(
+            f"/alerts/{rule_id}/delete", data={"_csrf_token": "test-token"}
+        )
+        self.assertEqual(response.status_code, 302)
+
+        conn = monitor.db()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) AS c FROM alert_rules").fetchone()["c"], 0
+            )
+            self.assertIsNone(
+                conn.execute("SELECT rule_id FROM notifications").fetchone()["rule_id"]
+            )
+        finally:
+            conn.close()
+
+    def test_due_check_uses_cached_schedule_state(self):
+        sensor = {
+            "id": 10, "paused_until": None, "interval_seconds": 60,
+            "last_timestamp": "2026-01-01 00:00:00",
+        }
+        self.assertFalse(monitor._sensor_due(sensor, datetime(2026, 1, 1, 0, 0, 59)))
+        self.assertTrue(monitor._sensor_due(sensor, datetime(2026, 1, 1, 0, 1, 1)))
+
+    def test_scheduler_records_completed_poll_without_network_access(self):
+        _, sensor_id = self._create_sensor()
+        original_check = monitor.run_sensor_check
+        monitor.run_sensor_check = lambda _sensor: ("up", 1.0, "ok", None)
+        try:
+            self.assertTrue(monitor.start_monitor())
+            deadline = time.monotonic() + 3
+            samples = 0
+            while time.monotonic() < deadline:
+                conn = monitor.db()
+                try:
+                    samples = conn.execute(
+                        "SELECT COUNT(*) AS c FROM sensor_data WHERE sensor_id = ?",
+                        (sensor_id,),
+                    ).fetchone()["c"]
+                finally:
+                    conn.close()
+                if samples:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(samples, 1)
+        finally:
+            monitor.run_sensor_check = original_check
+
+    def test_post_without_csrf_token_is_rejected(self):
+        client = monitor.app.test_client()
+        response = client.post("/login", data={"username": "admin", "password": "wrong"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_login_csrf_and_initial_password_change_flow(self):
+        client = monitor.app.test_client()
+        login_page = client.get("/login")
+        token = re.search(
+            r'name="_csrf_token" value="([^"]+)"', login_page.get_data(as_text=True)
+        ).group(1)
+        response = client.post(
+            "/login?next=https://example.invalid/",
+            data={"username": "admin", "password": "admin", "_csrf_token": token},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+
+        response = client.get("/", follow_redirects=False)
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/settings", response.headers["Location"])
+        settings_page = client.get("/settings")
+        token = re.search(
+            r'name="_csrf_token" value="([^"]+)"', settings_page.get_data(as_text=True)
+        ).group(1)
+        response = client.post(
+            "/change-password",
+            data={
+                "old_password": "admin", "new_password": "changed-password",
+                "confirm_password": "changed-password", "_csrf_token": token,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(monitor.get_setting("force_password_change"), "0")
+
+    def test_sensor_can_be_paused_and_resumed(self):
+        _, sensor_id = self._create_sensor()
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+            state["_csrf_token"] = "test-token"
+
+        response = client.post(
+            f"/sensors/{sensor_id}/pause",
+            data={"minutes": "15", "_csrf_token": "test-token"},
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = monitor.db()
+        try:
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT paused_until FROM sensors WHERE id = ?", (sensor_id,)
+                ).fetchone()["paused_until"]
+            )
+        finally:
+            conn.close()
+
+        response = client.post(
+            f"/sensors/{sensor_id}/resume",
+            data={"_csrf_token": "test-token"},
+        )
+        self.assertEqual(response.status_code, 302)
+        conn = monitor.db()
+        try:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT paused_until FROM sensors WHERE id = ?", (sensor_id,)
+                ).fetchone()["paused_until"]
+            )
+        finally:
+            conn.close()
+
+    def test_remote_http_is_rejected_without_explicit_opt_in(self):
+        original = (monitor.BIND_HOST, monitor.SSL_CERT_FILE,
+                    monitor.SSL_KEY_FILE, monitor.ALLOW_INSECURE_REMOTE)
+        try:
+            monitor.BIND_HOST = "0.0.0.0"
+            monitor.SSL_CERT_FILE = ""
+            monitor.SSL_KEY_FILE = ""
+            monitor.ALLOW_INSECURE_REMOTE = False
+            with self.assertRaisesRegex(ValueError, "Refusing remote HTTP"):
+                monitor.run_web_servers()
+        finally:
+            (monitor.BIND_HOST, monitor.SSL_CERT_FILE,
+             monitor.SSL_KEY_FILE, monitor.ALLOW_INSECURE_REMOTE) = original
+
+
+if __name__ == "__main__":
+    unittest.main()

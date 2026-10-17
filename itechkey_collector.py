@@ -31,8 +31,7 @@ def main():
         while not stopped.wait(1):
             pass
     finally:
-        monitor._monitor_stop.set()
-        monitor._flush_batch()
+        monitor.stop_monitor()
         logging.info("NetPulse collector process stopped")
 
 

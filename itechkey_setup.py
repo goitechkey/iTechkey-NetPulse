@@ -178,7 +178,7 @@ def write_config(config):
             "MONITOR_WORKERS=20",
         ]
     else:
-        env_lines.append("MONITOR_WORKERS=5")
+        env_lines += ["MONITOR_WORKERS=5", "ITECHKEY_BIND_HOST=127.0.0.1"]
     ENV_FILE.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
     CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
     ok(f"Config saved: {ENV_FILE.name}")
@@ -201,8 +201,10 @@ def init_database(config):
         ok("Tables created")
         if config["backend"] == "mysql":
             try:
-                app.ensure_partitions()
-                ok("Partitions ready")
+                if app.ensure_partitions():
+                    ok("Partitions ready")
+                else:
+                    warn("Partitioning is not configured; daily retention uses DELETE")
             except Exception as e:
                 warn(f"Partition setup: {e}")
         ok("Default admin ready (admin / admin)")
