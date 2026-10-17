@@ -261,6 +261,36 @@ class ReliabilityTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_group_and_snmp_credential_forms_render_valid_csrf_tokens(self):
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+
+        group_page = client.get("/groups/new")
+        token = re.search(
+            r'name="_csrf_token" value="([^"]+)"', group_page.get_data(as_text=True)
+        ).group(1)
+        self.assertNotEqual(token, "{{ csrf_token() }}")
+        response = client.post(
+            "/groups/new", data={"name": "Branch", "_csrf_token": token}
+        )
+        self.assertEqual(response.status_code, 302)
+
+        credential_page = client.get("/snmp-credentials/new")
+        token = re.search(
+            r'name="_csrf_token" value="([^"]+)"',
+            credential_page.get_data(as_text=True),
+        ).group(1)
+        response = client.post(
+            "/snmp-credentials/new",
+            data={
+                "name": "Branch SNMP", "version": "2c", "community": "public",
+                "port": "161", "_csrf_token": token,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
     def test_remote_http_is_rejected_without_explicit_opt_in(self):
         original = (monitor.BIND_HOST, monitor.SSL_CERT_FILE,
                     monitor.SSL_KEY_FILE, monitor.ALLOW_INSECURE_REMOTE)

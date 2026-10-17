@@ -2754,7 +2754,8 @@ def group_new():
         finally:
             conn.close()
         return _flash_redirect(url_for("devices"), "Group added")
-    return render_ctx(GROUP_FORM_HTML, "New group", "devices")
+    body = render_template_string(GROUP_FORM_HTML, url_for=url_for)
+    return render_ctx(body, "New group", "devices")
 
 
 @app.route("/groups/<int:gid>/delete", methods=["POST"])
@@ -2850,7 +2851,8 @@ def snmp_creds_new():
         finally:
             conn.close()
         return _flash_redirect(url_for("snmp_creds_page"), "Credential added")
-    return render_ctx(SNMP_CRED_FORM_HTML, "New SNMP credential", "devices")
+    body = render_template_string(SNMP_CRED_FORM_HTML, url_for=url_for)
+    return render_ctx(body, "New SNMP credential", "devices")
 
 
 @app.route("/snmp-credentials/<int:cid>/delete", methods=["POST"])
