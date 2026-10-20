@@ -116,6 +116,7 @@ MAX_POINTS_CHART = 500
 RETENTION_MONTHS = 6
 MONITOR_WORKERS = int(os.environ.get("MONITOR_WORKERS", 20))
 BATCH_FLUSH_SECONDS = 5
+RESTART_EXIT_CODE = 75
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -4165,20 +4166,27 @@ def _wait_for_monitor_shutdown():
 
 
 def run_application():
-    """Run the web dashboard and monitor, restarting both when requested."""
-    while True:
-        _restart_requested.clear()
-        start_monitor()
-        try:
-            print_banner()
-            run_web_servers()
-        finally:
-            stop_monitor()
+    """Run the web dashboard and monitor once; return whether a restart was requested."""
+    _restart_requested.clear()
+    start_monitor()
+    try:
+        print_banner()
+        run_web_servers()
+    finally:
+        stop_monitor()
 
-        if not _restart_requested.is_set():
-            return
+    if _restart_requested.is_set():
         _wait_for_monitor_shutdown()
-        logging.info("Restarting %s", __app_name__)
+        return True
+    return False
+
+
+def restart_current_process():
+    """Replace a direct run, or signal the background supervisor to start a new child."""
+    logging.info("Restarting %s process", __app_name__)
+    if os.environ.get("ITECHKEY_SUPERVISED") == "1":
+        raise SystemExit(RESTART_EXIT_CODE)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
@@ -4194,4 +4202,5 @@ if __name__ == "__main__":
         print("  ✗ DB init failed: " + str(e))
         print("  → Re-run: python itechkey_setup.py")
         sys.exit(1)
-    run_application()
+    if run_application():
+        restart_current_process()

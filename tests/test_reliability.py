@@ -1,11 +1,14 @@
 import tempfile
 import unittest
 import time
+import io
 from datetime import datetime, timedelta
 from pathlib import Path
 import re
+from unittest import mock
 
 import itechkey_monitor as monitor
+import itechkey_background as background
 from itechkey_snmp import SNMPClient
 
 
@@ -361,6 +364,29 @@ class ReliabilityTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(scheduled, [True])
+
+    def test_supervisor_starts_a_fresh_child_after_a_restart_request(self):
+        restart_child = mock.Mock()
+        restart_child.wait.return_value = background.RESTART_EXIT_CODE
+        new_child = mock.Mock()
+        new_child.wait.return_value = 0
+        log = io.StringIO()
+
+        with mock.patch.object(
+                background.subprocess, "Popen", side_effect=[restart_child, new_child]
+        ) as launch, mock.patch.object(background.time, "sleep"):
+            exit_code = background.run_supervised_monitor(log)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(launch.call_count, 2)
+        self.assertEqual(launch.call_args.kwargs["env"]["ITECHKEY_SUPERVISED"], "1")
+        self.assertIn("restart requested", log.getvalue())
+
+    def test_supervised_restart_exits_with_the_supervisor_restart_code(self):
+        with mock.patch.dict(monitor.os.environ, {"ITECHKEY_SUPERVISED": "1"}):
+            with self.assertRaises(SystemExit) as exited:
+                monitor.restart_current_process()
+        self.assertEqual(exited.exception.code, monitor.RESTART_EXIT_CODE)
 
     def test_remote_http_is_rejected_without_explicit_opt_in(self):
         original = (monitor.BIND_HOST, monitor.SSL_CERT_FILE,
