@@ -2004,7 +2004,11 @@ DASH_HTML = """
 <div class="meta">{{ s.group_name or '—' }} / {{ s.device_name }} ({{ s.host }})</div>
 <div style="display:flex;justify-content:space-between;align-items:center">
 <div><div class="lat">
+{% if s.sensor_type == 'snmp_storage' %}
+{% if s.latency_ms is not none %}{{ '%.1f'|format(s.latency_ms) }}% used{% else %}—{% endif %}
+{% else %}
 {% if s.latency_ms is not none %}{{ '%.0f'|format(s.latency_ms) }} ms{% else %}—{% endif %}
+{% endif %}
 </div>
 <div class="msg">{{ s.message or 'no data yet' }}</div>
 </div>
@@ -2026,7 +2030,11 @@ DASH_HTML = """
 <div class="meta">{{ s.device_name }} ({{ s.host }})</div>
 <div style="display:flex;justify-content:space-between;align-items:center">
 <div><div class="lat">
+{% if s.sensor_type == 'snmp_storage' %}
+{% if s.latency_ms is not none %}{{ '%.1f'|format(s.latency_ms) }}% used{% else %}—{% endif %}
+{% else %}
 {% if s.latency_ms is not none %}{{ '%.0f'|format(s.latency_ms) }} ms{% else %}—{% endif %}
+{% endif %}
 </div>
 <div class="msg">{{ s.message or 'no data yet' }}</div>
 </div>
@@ -2082,6 +2090,7 @@ def dashboard():
             eff = "paused" if (paused or not s["enabled"]) else (last_status or "paused")
             sensors.append({
                 "id": s["id"], "name": s["name"],
+                "sensor_type": s["sensor_type"],
                 "device_name": s["device_name"], "host": s["host"],
                 "group_id": s["group_id"], "group_name": s["group_name"],
                 "latency_ms": last["latency_ms"] if last else None,

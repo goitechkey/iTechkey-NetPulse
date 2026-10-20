@@ -344,6 +344,36 @@ class ReliabilityTests(unittest.TestCase):
         self.assertNotIn('<section class="sensor-group">', filtered_page)
         self.assertIn('Firewall / Firewall-01 (192.0.2.10)', filtered_page)
 
+    def test_dashboard_displays_storage_usage_as_a_percentage(self):
+        conn = monitor.db()
+        try:
+            device_id = conn.execute(
+                "INSERT INTO devices (name, host, created_at) VALUES (?, ?, ?)",
+                ("Storage Host", "192.0.2.30", "2026-01-01T00:00:00"),
+            ).lastrowid
+            sensor_id = conn.execute(
+                "INSERT INTO sensors (device_id, name, sensor_type, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (device_id, "Drive C", "snmp_storage", "2026-01-01T00:00:00"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO sensor_data (sensor_id, timestamp, status, latency_ms, message) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sensor_id, "2026-01-01 00:00:00", "up", 12.34, "C: 12.3% used"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+
+        page = client.get("/").get_data(as_text=True)
+        self.assertIn("12.3% used", page)
+        self.assertNotIn("12 ms", page)
+
     def test_restart_control_is_available_to_authenticated_users(self):
         monitor.set_setting("force_password_change", "0")
         client = monitor.app.test_client()
