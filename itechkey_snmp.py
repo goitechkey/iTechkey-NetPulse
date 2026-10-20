@@ -2,7 +2,7 @@
 itechkey_snmp.py — Minimal pure-Python SNMP v1/v2c client.
 Part of iTechkey NetPulse.
 Author : iTechkey
-Contact: admin@itechkey.com
+Contact: info@goitechkey.com
 Build  : 1.0.0
 """
 import socket

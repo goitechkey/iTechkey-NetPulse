@@ -2,7 +2,7 @@
 #  iTechkey NetPulse — Windows Installer & Launcher
 #  Version : 1.0.0
 #  Author  : iTechkey
-#  Contact : admin@itechkey.com
+#  Contact : info@goitechkey.com
 # ============================================================================
 #
 #  Usage: run iTechkey-Setup.exe as Administrator.

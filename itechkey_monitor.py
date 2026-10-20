@@ -2,7 +2,7 @@
 iTechkey NetPulse - Network Monitoring System
 Version : 1.1.0
 Author  : iTechkey
-Contact : info@itechkey.com
+Contact : info@goitechkey.com
 """
 
 import os
@@ -63,7 +63,9 @@ from itechkey_snmp import (
 __app_name__    = "iTechkey NetPulse"
 __app_version__ = "1.1.0"
 __author__      = "iTechkey"
-__contact__     = "admin@itechkey.com"
+__contact__     = "info@goitechkey.com"
+__website__     = "www.goitechkey.com"
+__website_url__ = "https://www.goitechkey.com"
 
 
 # ============================================================================
@@ -1171,6 +1173,19 @@ _last_alert = {}
 _alert_lock = threading.Lock()
 
 
+def _format_alert_value(sensor, value):
+    if value is None:
+        return "Not available"
+    sensor_type = sensor["sensor_type"]
+    if sensor_type == "snmp_storage":
+        return "%.1f%% used" % value
+    if sensor_type == "snmp_traffic":
+        return "%.4f Mbps (inbound)" % value
+    if sensor_type == "firewall_health":
+        return "%.0f active sessions" % value
+    return "%.1f ms" % value
+
+
 def _rule_matches(rule, status, latency, prev_status):
     cond = rule["condition"]
     if cond == "down" and status == "down":
@@ -1221,17 +1236,18 @@ def process_alerts(sensor, status, latency, message, prev_status):
 
         subject = "[%s] %s / %s / %s" % (
             status.upper(), grp_name, dev_name, sensor["name"])
-        body = (
-            "Sensor : %s (%s)\nDevice : %s (group: %s)\nStatus : %s\n"
-            "Latency: %s\nMessage: %s\nTime   : %s\n\n— %s v%s\n"
-        ) % (
-            sensor["name"], sensor["sensor_type"], dev_name, grp_name,
-            status.upper(),
-            ("%.1f ms" % latency) if latency is not None else "-",
-            message, now.strftime("%Y-%m-%d %H:%M:%S"),
-            __app_name__, __app_version__,
-        )
-        _deliver_notification(rule, sensor["id"], subject, body)
+        details = [
+            ("Sensor", sensor["name"]),
+            ("Device", dev_name),
+            ("Group", grp_name),
+            ("Sensor type", sensor["sensor_type"].replace("_", " ").title()),
+            ("Status", status.upper()),
+            ("Value", _format_alert_value(sensor, latency)),
+            ("Message", message or "Not available"),
+            ("Detected at", now.strftime("%Y-%m-%d %H:%M:%S")),
+        ]
+        body = "\n".join("%s: %s" % item for item in details)
+        _deliver_notification(rule, sensor["id"], subject, body, details)
 
 
 def _process_alerts_safe(sensor, status, latency, message, prev_status):
@@ -1241,11 +1257,11 @@ def _process_alerts_safe(sensor, status, latency, message, prev_status):
         logging.exception("Alert processing failed for sensor %s", sensor["id"])
 
 
-def _deliver_notification(rule, sensor_id, subject, body):
+def _deliver_notification(rule, sensor_id, subject, body, details=None):
     flags = []
     if rule["notify_email"]:
         try:
-            send_alert_email(subject, body)
+            send_alert_email(subject, body, details)
             flags.append("email:sent")
         except Exception as e:
             logging.exception("Alert email failed")
@@ -1281,7 +1297,7 @@ def _deliver_notification(rule, sensor_id, subject, body):
         conn.close()
 
 
-def send_alert_email(subject, body):
+def send_alert_email(subject, body, details=None):
     if get_setting("email_enabled") != "1":
         raise RuntimeError("Email not enabled in settings")
 
@@ -1301,23 +1317,61 @@ def send_alert_email(subject, body):
     msg.set_content(body)
 
     logo_data = LOGO_FILE.read_bytes() if LOGO_FILE.exists() else None
-    logo_tag = ('<img src="cid:itechkey_logo" style="height:44px">'
-                if logo_data else '<b style="color:#0a66c2">iTechkey</b>')
+    logo_tag = (
+        '<img src="cid:itechkey_logo" alt="iTechkey" style="height:40px;width:auto">'
+        if logo_data else '<b style="color:#ffffff;font-size:20px">iTechkey</b>'
+    )
+    subject_upper = subject.upper()
+    status_color = "#dc2626" if "[DOWN]" in subject_upper else (
+        "#f59e0b" if "[WARNING]" in subject_upper else "#16a34a"
+    )
+    if details:
+        detail_rows = "".join(
+            '<tr><td style="padding:10px 12px;border-bottom:1px solid #e8edf3;'
+            'color:#607083;font-size:12px;font-weight:700;width:35%">' +
+            escape(str(label)) + '</td><td style="padding:10px 12px;'
+            'border-bottom:1px solid #e8edf3;color:#1a2533;font-size:13px">' +
+            escape(str(value)) + '</td></tr>'
+            for label, value in details
+        )
+        alert_content = (
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            'style="border:1px solid #e1e7ef;border-radius:8px;border-collapse:separate;'
+            'overflow:hidden">' + detail_rows + '</table>'
+        )
+    else:
+        alert_content = (
+            '<div style="padding:16px;background:#f7f9fc;border:1px solid #e1e7ef;'
+            'border-radius:8px;color:#35465a;font-size:14px;line-height:1.6">' +
+            escape(body).replace("\n", "<br>") + '</div>'
+        )
 
     html_body = (
-        '<!doctype html><html><body style="font-family:Arial;color:#1a2533;'
-        'max-width:720px;margin:auto">'
-        '<div style="border-bottom:3px solid #0a66c2;padding-bottom:10px;'
-        'margin-bottom:16px">' + logo_tag +
-        '<span style="float:right;color:#6c757d;font-size:12px;'
-        'padding-top:14px">' + __app_name__ + ' v' + __app_version__ + '</span>'
-        '</div>'
-        '<pre style="font-family:Consolas,monospace;font-size:13px;'
-        'white-space:pre-wrap">' + escape(body) + '</pre>'
-        '<p style="color:#adb5bd;font-size:11px;margin-top:24px;'
-        'border-top:1px solid #e9ecef;padding-top:10px">'
-        '© ' + str(datetime.now().year) + ' ' + __author__ + ' · ' +
-        __contact__ + '</p></body></html>'
+        '<!doctype html><html><body style="margin:0;padding:24px 12px;background:#f1f5f9;'
+        'font-family:Arial,Helvetica,sans-serif;color:#1a2533">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="max-width:680px;margin:0 auto;background:#ffffff;border-radius:10px;'
+        'overflow:hidden;box-shadow:0 2px 8px rgba(15,28,46,.12)">'
+        '<tr><td style="padding:18px 24px;background:#0f1c2e;border-bottom:3px solid #0a66c2">' +
+        logo_tag +
+        '<span style="float:right;color:#cfd8e3;font-size:12px;padding-top:12px">' +
+        escape(__app_name__) + '</span></td></tr>'
+        '<tr><td style="padding:26px 24px 12px"><div style="display:inline-block;'
+        'padding:5px 10px;background:' + status_color + ';color:#ffffff;border-radius:14px;'
+        'font-size:11px;font-weight:700;letter-spacing:.4px">MONITORING ALERT</div>'
+        '<h1 style="margin:14px 0 8px;font-size:20px;color:#172b44">' +
+        escape(subject) + '</h1>'
+        '<p style="margin:0 0 20px;color:#607083;font-size:13px;line-height:1.5">'
+        'An automated alert was generated by ' + escape(__app_name__) + '.</p>' +
+        alert_content +
+        '<p style="margin:22px 0 0;color:#607083;font-size:12px;line-height:1.5">'
+        'Please review the monitored device and take action if required.</p></td></tr>'
+        '<tr><td style="padding:15px 24px;background:#f7f9fc;border-top:1px solid #e1e7ef;'
+        'color:#7b8998;font-size:11px">© ' + str(datetime.now().year) + ' iTechkey · '
+        '<a href="' + __website_url__ + '" style="color:#0a66c2;text-decoration:none">' +
+        __website__ + '</a> · <a href="mailto:' + __contact__ + '" '
+        'style="color:#0a66c2;text-decoration:none">' + __contact__ +
+        '</a></td></tr></table></body></html>'
     )
     msg.add_alternative(html_body, subtype="html")
 
@@ -1712,6 +1766,7 @@ input[type=checkbox]{width:auto}
 .chart-box{height:340px;position:relative}
 footer{text-align:center;color:#8a97a5;font-size:12px;padding:20px 0 30px}
 footer b{color:var(--primary)}
+footer a{color:var(--primary);text-decoration:none}
 </style></head><body>
 {% if session.user %}
 <nav>
@@ -1738,7 +1793,7 @@ footer b{color:var(--primary)}
 {% endwith %}
 {{ body|safe }}
 </div>
-<footer>© {{ year }} <b>iTechkey</b> NetPulse v{{ version }} · {{ contact }}</footer>
+<footer>© {{ year }} <b>iTechkey</b> NetPulse v{{ version }} · <a href="{{ website_url }}" target="_blank" rel="noopener">{{ website }}</a> · <a href="mailto:{{ contact }}">{{ contact }}</a></footer>
 </body></html>
 """
 
@@ -1777,7 +1832,8 @@ def render_ctx(body, title=None, active=None):
     return render_template_string(
         BASE_HTML, body=body, title=title, active=active,
         session=session, year=datetime.now().year,
-        version=__app_version__, contact=__contact__,
+        version=__app_version__, contact=__contact__, website=__website__,
+        website_url=__website_url__,
     )
 
 

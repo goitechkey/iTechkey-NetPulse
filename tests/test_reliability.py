@@ -374,6 +374,44 @@ class ReliabilityTests(unittest.TestCase):
         self.assertIn("12.3% used", page)
         self.assertNotIn("12 ms", page)
 
+    def test_footer_uses_the_new_contact_and_website(self):
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+
+        page = client.get("/").get_data(as_text=True)
+        self.assertIn("info@goitechkey.com", page)
+        self.assertIn("https://www.goitechkey.com", page)
+
+    def test_alert_email_uses_branded_html_details(self):
+        for key, value in {
+            "email_enabled": "1",
+            "smtp_sender": "alerts@example.test",
+            "smtp_password": "app-password",
+            "smtp_recipients": "ops@example.test",
+            "smtp_host": "smtp.example.test",
+            "smtp_port": "465",
+            "smtp_security": "ssl",
+        }.items():
+            monitor.set_setting(key, value)
+
+        smtp_client = mock.MagicMock()
+        with mock.patch.object(monitor.smtplib, "SMTP_SSL") as smtp_ssl:
+            smtp_ssl.return_value.__enter__.return_value = smtp_client
+            monitor.send_alert_email(
+                "[DOWN] Servers / File Server / Drive C",
+                "Status: DOWN",
+                [("Status", "DOWN"), ("Message", "Disk use is 95%")],
+            )
+
+        message = smtp_client.send_message.call_args.args[0]
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("MONITORING ALERT", html)
+        self.assertIn("Disk use is 95%", html)
+        self.assertIn("www.goitechkey.com", html)
+        self.assertIn("info@goitechkey.com", html)
+
     def test_restart_control_is_available_to_authenticated_users(self):
         monitor.set_setting("force_password_change", "0")
         client = monitor.app.test_client()

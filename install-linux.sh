@@ -3,7 +3,7 @@
 #  iTechkey NetPulse — Linux/macOS Installer & Launcher
 #  Version : 1.0.0
 #  Author  : iTechkey
-#  Contact : admin@itechkey.com
+#  Contact : info@goitechkey.com
 # ============================================================================
 #
 #  Usage:
