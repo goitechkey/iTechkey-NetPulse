@@ -1357,6 +1357,31 @@ _last_poll_at = {}
 _last_status = {}
 _monitor_start_lock = threading.Lock()
 _monitor_started = False
+_restart_requested = threading.Event()
+_web_server_lock = threading.Lock()
+_active_web_servers = []
+
+
+def _stop_web_servers_for_restart():
+    """Stop the current web servers after the restart response is delivered."""
+    with _web_server_lock:
+        servers = tuple(_active_web_servers)
+    for server in servers:
+        try:
+            server.shutdown()
+        except Exception:
+            logging.exception("Could not stop web server for restart")
+
+
+def schedule_application_restart():
+    """Request a single graceful restart of the dashboard and monitor."""
+    if _restart_requested.is_set():
+        return False
+    _restart_requested.set()
+    timer = threading.Timer(0.5, _stop_web_servers_for_restart)
+    timer.daemon = True
+    timer.start()
+    return True
 
 
 def _flush_batch():
@@ -1655,6 +1680,10 @@ tr:hover td{background:#fafbfc}
 .warning{background:var(--warn);color:#111}
 .paused{background:#6c757d}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.sensor-group{margin-bottom:26px}
+.sensor-group-heading{display:flex;align-items:baseline;gap:10px;margin:0 0 10px}
+.sensor-group-heading h2{margin:0;font-size:18px}
+.sensor-group-count{color:#6c757d;font-size:12px;font-weight:600}
 .sensor-card{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:5px solid #ccc;cursor:pointer;transition:.15s}
 .sensor-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.12)}
 .sensor-card.up{border-left-color:var(--up)}
@@ -1965,6 +1994,7 @@ DASH_HTML = """
 {% endfor %}
 </select></form></div>
 {% if sensors %}
+{% if group_filter %}
 <div class="grid">
 {% for s in sensors %}
 <a href="{{ url_for('sensor_detail', sid=s.id) }}" style="text-decoration:none;color:inherit">
@@ -1981,6 +2011,31 @@ DASH_HTML = """
 </div></div></a>
 {% endfor %}</div>
 {% else %}
+{% for group in sensor_groups %}
+<section class="sensor-group">
+<div class="sensor-group-heading">
+<h2>{{ group.name }}</h2>
+<span class="sensor-group-count">{{ group.sensors|length }} sensor{{ '' if group.sensors|length == 1 else 's' }}</span>
+</div>
+<div class="grid">
+{% for s in group.sensors %}
+<a href="{{ url_for('sensor_detail', sid=s.id) }}" style="text-decoration:none;color:inherit">
+<div class="sensor-card {{ s.effective_status }}">
+<h3>{{ s.name }}</h3>
+<div class="meta">{{ s.device_name }} ({{ s.host }})</div>
+<div style="display:flex;justify-content:space-between;align-items:center">
+<div><div class="lat">
+{% if s.latency_ms is not none %}{{ '%.0f'|format(s.latency_ms) }} ms{% else %}—{% endif %}
+</div>
+<div class="msg">{{ s.message or 'no data yet' }}</div>
+</div>
+<span class="badge {{ s.effective_status }}">{{ s.effective_status|upper }}</span>
+</div></div></a>
+{% endfor %}</div>
+</section>
+{% endfor %}
+{% endif %}
+{% else %}
 <div class="card">No sensors yet. <a href="{{ url_for('device_new') }}">Add a device</a> to begin.</div>
 {% endif %}
 """
@@ -1994,17 +2049,18 @@ def dashboard():
     try:
         if group_filter:
             sql = ("SELECT s.*, d.name AS device_name, d.host, "
-                   "g.name AS group_name FROM sensors s "
+                   "d.group_id AS group_id, g.name AS group_name FROM sensors s "
                    "JOIN devices d ON d.id = s.device_id "
                    "LEFT JOIN groups g ON g.id = d.group_id "
                    "WHERE d.group_id = ? ORDER BY g.name, d.name, s.name")
             rows = conn.execute(sql, (group_filter,)).fetchall()
         else:
             sql = ("SELECT s.*, d.name AS device_name, d.host, "
-                   "g.name AS group_name FROM sensors s "
+                   "d.group_id AS group_id, g.name AS group_name FROM sensors s "
                    "JOIN devices d ON d.id = s.device_id "
                    "LEFT JOIN groups g ON g.id = d.group_id "
-                   "ORDER BY g.name, d.name, s.name")
+                   "ORDER BY CASE WHEN g.name IS NULL THEN 1 ELSE 0 END, "
+                   "g.name, d.name, s.name")
             rows = conn.execute(sql).fetchall()
 
         now = datetime.now()
@@ -2026,7 +2082,7 @@ def dashboard():
             sensors.append({
                 "id": s["id"], "name": s["name"],
                 "device_name": s["device_name"], "host": s["host"],
-                "group_name": s["group_name"],
+                "group_id": s["group_id"], "group_name": s["group_name"],
                 "latency_ms": last["latency_ms"] if last else None,
                 "message": last["message"] if last else None,
                 "effective_status": eff,
@@ -2034,13 +2090,26 @@ def dashboard():
             counts["total"] += 1
             if eff in counts:
                 counts[eff] += 1
+        sensor_groups = []
+        if not group_filter:
+            grouped = {}
+            for sensor in sensors:
+                group_id = sensor["group_id"]
+                if group_id not in grouped:
+                    grouped[group_id] = {
+                        "name": sensor["group_name"] or "Ungrouped",
+                        "sensors": [],
+                    }
+                    sensor_groups.append(grouped[group_id])
+                grouped[group_id]["sensors"].append(sensor)
         groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
     finally:
         conn.close()
 
     body = render_template_string(
         DASH_HTML, sensors=sensors, counts=counts,
-        groups=groups, group_filter=group_filter, url_for=url_for)
+        groups=groups, group_filter=group_filter, sensor_groups=sensor_groups,
+        url_for=url_for)
     return render_ctx(body, "Dashboard", "dash")
 
 
@@ -3770,6 +3839,12 @@ Gmail: use App Password (regular password won't work).</p>
 <input name="confirm_password" type="password" required></div></div>
 <button class="btn">Change Password</button>
 </form></div>
+<div class="card"><h2>Restart Application</h2>
+<p style="color:#5b6b7b;font-size:13px">Restarts the dashboard and monitoring service. The page will be unavailable for a few seconds while it starts again.</p>
+<form method="post" action="{{ url_for('restart_application') }}" onsubmit="return confirm('Restart iTechkey NetPulse now?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<button class="btn grey" type="submit">↻ Restart Application</button>
+</form></div>
 <div class="card"><h2>About</h2><table>
 <tr><td>Application</td><td><b>{{ app_name }}</b></td></tr>
 <tr><td>Version</td><td>{{ version }}</td></tr>
@@ -3816,6 +3891,17 @@ def settings_page():
         author=__author__, contact=__contact__,
         db_backend=DB_BACKEND.upper())
     return render_ctx(body, "Settings", "settings")
+
+
+@app.route("/restart", methods=["POST"])
+@login_required
+def restart_application():
+    if schedule_application_restart():
+        logging.info("Application restart requested by %s", session["user"])
+        flash("Restarting iTechkey NetPulse. The dashboard will be ready in a few seconds.", "ok")
+    else:
+        flash("A restart is already in progress.", "ok")
+    return redirect(url_for("settings_page"))
 
 
 @app.route("/change-password", methods=["POST"])
@@ -4051,6 +4137,8 @@ def run_web_servers():
     servers = [http_server]
     if https_server:
         servers.append(https_server)
+    with _web_server_lock:
+        _active_web_servers[:] = servers
 
     server_threads = []
     for server in servers:
@@ -4067,6 +4155,30 @@ def run_web_servers():
         for server in servers:
             server.shutdown()
             server.server_close()
+        with _web_server_lock:
+            _active_web_servers.clear()
+
+
+def _wait_for_monitor_shutdown():
+    while _monitor_started:
+        time.sleep(0.05)
+
+
+def run_application():
+    """Run the web dashboard and monitor, restarting both when requested."""
+    while True:
+        _restart_requested.clear()
+        start_monitor()
+        try:
+            print_banner()
+            run_web_servers()
+        finally:
+            stop_monitor()
+
+        if not _restart_requested.is_set():
+            return
+        _wait_for_monitor_shutdown()
+        logging.info("Restarting %s", __app_name__)
 
 
 if __name__ == "__main__":
@@ -4082,9 +4194,4 @@ if __name__ == "__main__":
         print("  ✗ DB init failed: " + str(e))
         print("  → Re-run: python itechkey_setup.py")
         sys.exit(1)
-    start_monitor()
-    try:
-        print_banner()
-        run_web_servers()
-    finally:
-        stop_monitor()
+    run_application()

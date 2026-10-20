@@ -18,6 +18,9 @@ class ReliabilityTests(unittest.TestCase):
         monitor._data_queue = []
         monitor._last_poll_at.clear()
         monitor._last_status.clear()
+        monitor._restart_requested.clear()
+        with monitor._web_server_lock:
+            monitor._active_web_servers.clear()
         monitor.init_db()
 
     def tearDown(self):
@@ -30,6 +33,7 @@ class ReliabilityTests(unittest.TestCase):
         monitor._data_queue = []
         monitor._last_poll_at.clear()
         monitor._last_status.clear()
+        monitor._restart_requested.clear()
         self.temp_dir.cleanup()
 
     def _create_sensor(self):
@@ -290,6 +294,73 @@ class ReliabilityTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 302)
+
+    def test_dashboard_separates_sensors_by_group_in_all_groups_view(self):
+        conn = monitor.db()
+        try:
+            firewall_group = conn.execute(
+                "INSERT INTO groups (name, created_at) VALUES (?, ?)",
+                ("Firewall", "2026-01-01T00:00:00"),
+            ).lastrowid
+            windows_group = conn.execute(
+                "INSERT INTO groups (name, created_at) VALUES (?, ?)",
+                ("Windows Server", "2026-01-01T00:00:00"),
+            ).lastrowid
+            firewall_device = conn.execute(
+                "INSERT INTO devices (group_id, name, host, created_at) VALUES (?, ?, ?, ?)",
+                (firewall_group, "Firewall-01", "192.0.2.10", "2026-01-01T00:00:00"),
+            ).lastrowid
+            windows_device = conn.execute(
+                "INSERT INTO devices (group_id, name, host, created_at) VALUES (?, ?, ?, ?)",
+                (windows_group, "Windows-01", "192.0.2.20", "2026-01-01T00:00:00"),
+            ).lastrowid
+            conn.executemany(
+                "INSERT INTO sensors (device_id, name, sensor_type, created_at) VALUES (?, ?, ?, ?)",
+                [
+                    (firewall_device, "Firewall Ping", "ping", "2026-01-01T00:00:00"),
+                    (windows_device, "Windows Disk", "snmp_storage", "2026-01-01T00:00:00"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+
+        page = client.get("/").get_data(as_text=True)
+        self.assertIn('<h2>Firewall</h2>', page)
+        self.assertIn('<h2>Windows Server</h2>', page)
+        self.assertLess(page.index('<h2>Firewall</h2>'), page.index('<h2>Windows Server</h2>'))
+        self.assertIn('Firewall-01 (192.0.2.10)', page)
+        self.assertIn('Windows-01 (192.0.2.20)', page)
+
+        filtered_page = client.get(f"/?group={firewall_group}").get_data(as_text=True)
+        self.assertNotIn('<section class="sensor-group">', filtered_page)
+        self.assertIn('Firewall / Firewall-01 (192.0.2.10)', filtered_page)
+
+    def test_restart_control_is_available_to_authenticated_users(self):
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+            state["_csrf_token"] = "test-token"
+
+        settings_page = client.get("/settings").get_data(as_text=True)
+        self.assertIn("Restart Application", settings_page)
+
+        original_schedule = monitor.schedule_application_restart
+        scheduled = []
+        monitor.schedule_application_restart = lambda: scheduled.append(True) or True
+        try:
+            response = client.post("/restart", data={"_csrf_token": "test-token"})
+        finally:
+            monitor.schedule_application_restart = original_schedule
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(scheduled, [True])
 
     def test_remote_http_is_rejected_without_explicit_opt_in(self):
         original = (monitor.BIND_HOST, monitor.SSL_CERT_FILE,
