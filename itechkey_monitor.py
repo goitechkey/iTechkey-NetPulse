@@ -6,6 +6,9 @@ Contact : info@goitechkey.com
 """
 
 import os
+import base64
+import hashlib
+import re
 import sys
 import json
 import time
@@ -55,6 +58,7 @@ from itechkey_snmp import (
     SNMPClient, SNMPError, SNMPTimeout,
     discover_interfaces, discover_storage, IF_OPER_STATUS, IF_MIB,
 )
+from itechkey_ssh import SSHError, SSHSwitchClient, SSH_PROFILE_REGISTRY
 
 
 # ============================================================================
@@ -236,17 +240,29 @@ CREATE TABLE IF NOT EXISTS snmp_credentials (
     port INTEGER DEFAULT 161,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ssh_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'cisco_ios',
+    username TEXT NOT NULL,
+    password TEXT,
+    port INTEGER DEFAULT 22,
+    host_key_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS devices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id INTEGER,
     snmp_cred_id INTEGER,
+    ssh_cred_id INTEGER,
     device_role TEXT,
     name TEXT NOT NULL,
     host TEXT NOT NULL,
     tags TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE SET NULL,
-    FOREIGN KEY (snmp_cred_id) REFERENCES snmp_credentials(id) ON DELETE SET NULL
+    FOREIGN KEY (snmp_cred_id) REFERENCES snmp_credentials(id) ON DELETE SET NULL,
+    FOREIGN KEY (ssh_cred_id) REFERENCES ssh_credentials(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS sensors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -332,10 +348,22 @@ CREATE TABLE IF NOT EXISTS snmp_credentials (
     created_at VARCHAR(32) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS ssh_credentials (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    profile VARCHAR(32) NOT NULL DEFAULT 'cisco_ios',
+    username VARCHAR(150) NOT NULL,
+    password TEXT,
+    port INT DEFAULT 22,
+    host_key_sha256 VARCHAR(100) NOT NULL,
+    created_at VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS devices (
     id INT AUTO_INCREMENT PRIMARY KEY,
     group_id INT,
     snmp_cred_id INT,
+    ssh_cred_id INT,
     device_role VARCHAR(32),
     name VARCHAR(150) NOT NULL,
     host VARCHAR(150) NOT NULL,
@@ -345,7 +373,9 @@ CREATE TABLE IF NOT EXISTS devices (
     CONSTRAINT fk_devices_group FOREIGN KEY (group_id)
         REFERENCES groups(id) ON DELETE SET NULL,
     CONSTRAINT fk_devices_cred FOREIGN KEY (snmp_cred_id)
-        REFERENCES snmp_credentials(id) ON DELETE SET NULL
+        REFERENCES snmp_credentials(id) ON DELETE SET NULL,
+    CONSTRAINT fk_devices_ssh_cred FOREIGN KEY (ssh_cred_id)
+        REFERENCES ssh_credentials(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS sensors (
@@ -569,10 +599,19 @@ def init_db():
             if col not in cols:
                 conn.execute("ALTER TABLE " + table + " ADD COLUMN " + col + " " + decl)
         _ensure_col("devices", "snmp_cred_id", "INTEGER")
+        _ensure_col("devices", "ssh_cred_id", "INTEGER")
         _ensure_col("devices", "device_role", "TEXT")
         _ensure_col("sensor_data", "value_in", "REAL")
         _ensure_col("sensor_data", "value_out", "REAL")
         _ensure_col("sensor_data", "meta", "TEXT")
+    else:
+        column = conn.execute(
+            "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'devices' "
+            "AND COLUMN_NAME = 'ssh_cred_id'"
+        ).fetchone()
+        if not column or not column["c"]:
+            conn.execute("ALTER TABLE devices ADD COLUMN ssh_cred_id INT NULL")
 
     row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
     created_default_admin = bool(row and row["c"] == 0)
@@ -828,9 +867,13 @@ def _sensor_device_ctx(sensor_row):
     conn = db()
     try:
         return conn.execute(
-            "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port "
+            "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port, "
+            "sc.profile AS ssh_profile, sc.username AS ssh_username, "
+            "sc.password AS ssh_password, sc.port AS ssh_port, "
+            "sc.host_key_sha256 AS ssh_host_key_sha256 "
             "FROM devices d "
             "LEFT JOIN snmp_credentials c ON c.id = d.snmp_cred_id "
+            "LEFT JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "
             "WHERE d.id = ?",
             (sensor_row["device_id"],),
         ).fetchone()
@@ -852,6 +895,39 @@ def _snmp_for(dev, timeout=5, retries=1):
         dev["host"], community=dev["community"], version=ver,
         port=dev["snmp_port"] or 161, timeout=timeout, retries=retries,
     )
+
+
+def _ssh_for(dev, timeout=10):
+    if not dev or not dev["ssh_username"]:
+        raise SSHError("Device has no SSH profile attached")
+    return SSHSwitchClient(
+        dev["host"], username=dev["ssh_username"],
+        password=_decrypt_ssh_password(dev["ssh_password"]),
+        port=dev["ssh_port"] or 22, timeout=timeout,
+        profile=dev["ssh_profile"] or "cisco_ios",
+        expected_host_key=dev["ssh_host_key_sha256"],
+    )
+
+
+def _ssh_password_cipher():
+    from cryptography.fernet import Fernet
+    key = base64.urlsafe_b64encode(
+        hashlib.sha256(app.secret_key + b"|iTechkey SSH credentials v1").digest()
+    )
+    return Fernet(key)
+
+
+def _encrypt_ssh_password(password):
+    return "fernet:" + _ssh_password_cipher().encrypt(password.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_ssh_password(value):
+    if not value or not value.startswith("fernet:"):
+        return value  # Legacy plaintext values remain readable during migration.
+    try:
+        return _ssh_password_cipher().decrypt(value[len("fernet:"):].encode("ascii")).decode("utf-8")
+    except Exception as exc:
+        raise SSHError("SSH credential cannot be decrypted; verify the application secret key") from exc
 
 
 def _format_traffic_rate(mbps):
@@ -1077,6 +1153,94 @@ def check_snmp_interface(sensor_row):
     return status, None, msg, meta
 
 
+def _ssh_port_details(sensor_row):
+    params = json.loads(sensor_row["params"] or "{}")
+    port = str(params.get("port") or "").strip()
+    if not port:
+        raise SSHError("No switch port configured")
+    dev = _sensor_device_ctx(sensor_row)
+    client = _ssh_for(dev, timeout=sensor_row["timeout_seconds"] or 10)
+    return client.port_details(port)
+
+
+def check_ssh_interface(sensor_row):
+    try:
+        details = _ssh_port_details(sensor_row)
+    except SSHError as exc:
+        return "down", None, "SSH: " + str(exc), None
+    status = "up" if details["oper_status"] == "up" else "down"
+    message = "%s admin=%s line=%s; errors in/out/CRC=%s/%s/%s" % (
+        details["port"], details["admin_status"], details["line_status"],
+        details["input_errors"], details["output_errors"], details["crc_errors"],
+    )
+    return status, None, message, json.dumps(details)
+
+
+def check_ssh_traffic(sensor_row):
+    try:
+        details = _ssh_port_details(sensor_row)
+    except SSHError as exc:
+        return "down", None, "SSH: " + str(exc), None
+    in_mbps, out_mbps = details["in_mbps"], details["out_mbps"]
+    meta = json.dumps(details)
+    if in_mbps is None or out_mbps is None:
+        return "down", None, "SSH traffic rates were not present in switch output", meta
+    peak = max(in_mbps, out_mbps)
+    warning, error = sensor_row["warning_latency_ms"], sensor_row["error_latency_ms"]
+    status = "down" if error is not None and peak >= error else (
+        "warning" if warning is not None and peak >= warning else details["oper_status"]
+    )
+    if status not in ("up", "warning", "down"):
+        status = "down"
+    message = "%s IN %s / OUT %s; link=%s" % (
+        details["port"], _format_traffic_rate(in_mbps),
+        _format_traffic_rate(out_mbps), details["oper_status"],
+    )
+    return status, in_mbps, message, meta
+
+
+def check_ssh_errors(sensor_row):
+    try:
+        details = _ssh_port_details(sensor_row)
+    except SSHError as exc:
+        return "down", None, "SSH: " + str(exc), None
+    conn = db()
+    try:
+        previous = conn.execute(
+            "SELECT meta FROM sensor_data WHERE sensor_id = ? "
+            "ORDER BY id DESC LIMIT 1", (sensor_row["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    keys = ("input_errors", "output_errors", "crc_errors")
+    old = {}
+    has_baseline = False
+    if previous and previous["meta"]:
+        try:
+            old = json.loads(previous["meta"])
+            has_baseline = all(isinstance(old.get(key), int) for key in keys)
+        except (ValueError, TypeError):
+            old = {}
+    deltas = {
+        key: max(0, details[key] - old[key])
+        if details.get(key) is not None and isinstance(old.get(key), int)
+        else (details.get(key) or 0)
+        for key in keys
+    }
+    total = sum(deltas.values()) if has_baseline else 0
+    warning, error = sensor_row["warning_latency_ms"], sensor_row["error_latency_ms"]
+    status = "down" if error is not None and total >= error else (
+        "warning" if warning is not None and total >= warning else "up"
+    )
+    details["error_delta"] = deltas
+    message = ("Error counter baseline recorded" if not has_baseline else
+               "%s new errors this poll (in=%s, out=%s, CRC=%s)" % (
+                   total, deltas["input_errors"], deltas["output_errors"],
+                   deltas["crc_errors"],
+               ))
+    return status, total, message, json.dumps(details)
+
+
 def check_firewall_health(sensor_row):
     params = json.loads(sensor_row["params"] or "{}")
     vendor = params.get("vendor", "fortinet")
@@ -1161,6 +1325,12 @@ def run_sensor_check(sensor_row):
         return check_snmp_interface(sensor_row)
     if stype == "snmp_storage":
         return check_snmp_storage(sensor_row)
+    if stype == "ssh_traffic":
+        return check_ssh_traffic(sensor_row)
+    if stype == "ssh_interface":
+        return check_ssh_interface(sensor_row)
+    if stype == "ssh_errors":
+        return check_ssh_errors(sensor_row)
     if stype == "firewall_health":
         return check_firewall_health(sensor_row)
     return "down", None, "Unknown sensor type: " + stype, None
@@ -1179,8 +1349,10 @@ def _format_alert_value(sensor, value):
     sensor_type = sensor["sensor_type"]
     if sensor_type == "snmp_storage":
         return "%.1f%% used" % value
-    if sensor_type == "snmp_traffic":
+    if sensor_type in ("snmp_traffic", "ssh_traffic"):
         return "%.4f Mbps (inbound)" % value
+    if sensor_type == "ssh_errors":
+        return "%.0f new errors" % value
     if sensor_type == "firewall_health":
         return "%.0f active sessions" % value
     return "%.1f ms" % value
@@ -1477,7 +1649,7 @@ def _poll_sensor(sensor):
         status, latency, message, meta = "down", None, "crash: " + str(e), None
 
     v_in = v_out = None
-    if meta and sensor["sensor_type"] == "snmp_traffic":
+    if meta and sensor["sensor_type"] in ("snmp_traffic", "ssh_traffic"):
         try:
             md = json.loads(meta)
             v_in = md.get("in_mbps")
@@ -2214,7 +2386,7 @@ SENSOR_DETAIL_HTML = """
 </div>
 <div class="card">
 <div class="toolbar" style="margin-bottom:6px">
-<h2 style="margin:0">{% if sensor.sensor_type == 'snmp_traffic' %}Traffic History{% elif sensor.sensor_type == 'snmp_storage' %}Storage Utilization History{% else %}Latency History{% endif %}</h2><span class="spacer"></span>
+<h2 style="margin:0">{% if sensor.sensor_type in ['snmp_traffic','ssh_traffic'] %}Traffic History{% elif sensor.sensor_type == 'snmp_storage' %}Storage Utilization History{% elif sensor.sensor_type == 'ssh_errors' %}Port Error History{% else %}Sensor History{% endif %}</h2><span class="spacer"></span>
 <span style="font-size:12px;color:#6c757d">Auto-refresh 10s · sensor polls every {{ sensor.interval_seconds }}s</span>
 <select id="rangeSel" onchange="loadChart()">
 <option value="1">Live · last 60 minutes</option>
@@ -2222,23 +2394,23 @@ SENSOR_DETAIL_HTML = """
 <option value="168">Last 7 days</option>
 <option value="720">Last 30 days</option>
 </select></div>
-{% if sensor.sensor_type == 'snmp_traffic' %}<div style="margin:8px 0;padding:11px 13px;border-left:4px solid #0a66c2;background:#eef6ff;border-radius:5px;color:#29415c;font-size:13px">Live shows the last 60 minutes and refreshes every 10 seconds. New rates arrive only on the sensor poll interval ({{ sensor.interval_seconds }}s). The first poll records a byte-counter baseline; rates appear after a later poll changes those counters.</div>{% endif %}
+{% if sensor.sensor_type in ['snmp_traffic','ssh_traffic'] %}<div style="margin:8px 0;padding:11px 13px;border-left:4px solid #0a66c2;background:#eef6ff;border-radius:5px;color:#29415c;font-size:13px">Live shows the last 60 minutes and refreshes every 10 seconds. SSH values use the switch CLI five-minute average; SNMP values are calculated from counter deltas.</div>{% endif %}
 <div id="chartMessage" role="status" style="display:none;color:#6c757d;padding:12px 0"></div>
 <div class="chart-box"><canvas id="chart"></canvas></div></div>
 <div class="card"><h2>Recent Checks (latest 100)</h2>
 <table><thead><tr><th>Timestamp</th><th>Status</th><th>Value</th><th>Message</th></tr></thead><tbody id="recentChecks">
 {% for r in recent %}<tr><td>{{ r.timestamp }}</td>
 <td><span class="badge {{ r.status }}">{{ r.status|upper }}</span></td>
-<td>{% if sensor.sensor_type == 'snmp_traffic' %}
+<td>{% if sensor.sensor_type in ['snmp_traffic','ssh_traffic'] %}
 IN {{ r.value_in|traffic_rate }} / OUT {{ r.value_out|traffic_rate }}
-{% elif r.latency_ms is not none %}{{ '%.1f'|format(r.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% else %} ms{% endif %}{% else %}-{% endif %}</td>
+{% elif r.latency_ms is not none %}{{ '%.1f'|format(r.latency_ms) }}{% if sensor.sensor_type == 'snmp_storage' %}%{% elif sensor.sensor_type == 'ssh_errors' %} errors{% else %} ms{% endif %}{% else %}-{% endif %}</td>
 <td>{{ r.message }}</td></tr>{% endfor %}
 </tbody></table></div>
 <script>
 let chart;
 let chartLoading=false;
 const sensorType='{{ sensor.sensor_type }}';
-const sensorUnit=sensorType==='snmp_storage'?'%':(sensorType==='snmp_traffic'?'Mbps':'ms');
+const sensorUnit=sensorType==='snmp_storage'?'%':(sensorType==='ssh_errors'?'errors':((sensorType==='snmp_traffic'||sensorType==='ssh_traffic')?'Mbps':'ms'));
 const sensorId={{ sensor.id }};
 const statusClasses=['up','warning','down','paused'];
 
@@ -2259,7 +2431,7 @@ async function loadChart(){
         updateLatest(data.latest);
         updateRecent(data.recent||[]);
         if(!window.Chart){showChartMessage('Chart library did not load. Check your internet/CDN access and reload.');return;}
-        const isTraffic=sensorType==='snmp_traffic';
+        const isTraffic=sensorType==='snmp_traffic'||sensorType==='ssh_traffic';
         const peakRate=isTraffic?Math.max(0,...data.in_values,...data.out_values):0;
         const trafficScale=isTraffic&&peakRate>0&&peakRate<1?1000:1;
         const chartUnit=isTraffic?(trafficScale===1000?'Kbps':'Mbps'):sensorUnit;
@@ -2268,7 +2440,7 @@ async function loadChart(){
         const datasets=isTraffic?[
             {label:'IN ('+chartUnit+')',data:inSeries,borderColor:'#0a66c2',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false},
             {label:'OUT ('+chartUnit+')',data:outSeries,borderColor:'#6f42c1',tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}
-        ]:[{label:sensorUnit==='%'?'Used (%)':'Latency ('+sensorUnit+')',data:data.values,borderColor:'#0a66c2',
+        ]:[{label:sensorUnit==='%'?'Used (%)':(sensorType==='ssh_errors'?'New errors/poll':'Latency ('+sensorUnit+')'),data:data.values,borderColor:'#0a66c2',
             backgroundColor:'rgba(10,102,194,.15)',fill:true,tension:.25,pointRadius:0,borderWidth:2,spanGaps:false}];
         if(chart){
             chart.data.labels=data.labels;
@@ -2318,7 +2490,7 @@ function updateLatest(latest){
     const badge=document.getElementById('sensorStatus');
     badge.classList.remove(...statusClasses);badge.classList.add(status);badge.textContent=status.toUpperCase();
     let details='';
-    if(sensorType==='snmp_traffic'&&latest.value_in!==null&&latest.value_out!==null){
+    if((sensorType==='snmp_traffic'||sensorType==='ssh_traffic')&&latest.value_in!==null&&latest.value_out!==null){
         details=' — IN '+formatTrafficRate(latest.value_in)+' / OUT '+formatTrafficRate(latest.value_out);
     }else if(latest.value!==null&&latest.value!==undefined){details=' — '+formatValue(latest.value);}
     document.getElementById('lastCheck').textContent='Last check: '+latest.timestamp+details+' — '+(latest.message||'');
@@ -2340,7 +2512,7 @@ function updateRecent(rows){
         const statusCell=document.createElement('td');
         const badge=document.createElement('span');badge.className='badge '+(row.status||'paused');badge.textContent=(row.status||'paused').toUpperCase();statusCell.appendChild(badge);
         const value=document.createElement('td');
-        value.textContent=sensorType==='snmp_traffic'&&row.value_in!==null&&row.value_out!==null
+        value.textContent=(sensorType==='snmp_traffic'||sensorType==='ssh_traffic')&&row.value_in!==null&&row.value_out!==null
             ?'IN '+formatTrafficRate(row.value_in)+' / OUT '+formatTrafficRate(row.value_out)
             :formatValue(row.value);
         const message=document.createElement('td');message.textContent=row.message||'';
@@ -2578,7 +2750,8 @@ DEVICES_HTML = """
 <span class="spacer"></span>
 <a class="btn" href="{{ url_for('device_new') }}">+ Add Device</a>
 <a class="btn grey" href="{{ url_for('group_new') }}">+ Add Group</a>
-<a class="btn grey" href="{{ url_for('snmp_creds_page') }}">SNMP Credentials</a></div>
+<a class="btn grey" href="{{ url_for('snmp_creds_page') }}">SNMP Credentials</a>
+<a class="btn grey" href="{{ url_for('ssh_creds_page') }}">SSH Profiles</a></div>
 <div class="card"><h2>Groups</h2>
 {% if groups %}<table>
 <tr><th>Name</th><th>Description</th><th>Devices</th><th></th></tr>
@@ -2764,6 +2937,12 @@ DEVICE_FORM_HTML = """
 {% for c in snmp_creds %}
 <option value="{{ c.id }}" {{ 'selected' if device and device.snmp_cred_id==c.id }}>{{ c.name }} (v{{ c.version }})</option>
 {% endfor %}</select></div></div>
+<div class="row"><div><label>SSH switch profile</label>
+<select name="ssh_cred_id"><option value="">— none —</option>
+{% for c in ssh_creds %}
+<option value="{{ c.id }}" {{ 'selected' if device and device.ssh_cred_id==c.id }}>{{ c.name }} ({{ c.profile }})</option>
+{% endfor %}</select>
+<small><a href="{{ url_for('ssh_creds_page') }}">Manage SSH profiles and credentials</a></small></div></div>
 <div class="row">
 <div><label>Tags</label>
 <input name="tags" value="{{ device.tags if device else '' }}"></div></div>
@@ -2780,17 +2959,19 @@ def device_new():
     try:
         groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
         creds = conn.execute("SELECT * FROM snmp_credentials ORDER BY name").fetchall()
+        ssh_creds = conn.execute("SELECT id, name, profile FROM ssh_credentials ORDER BY name").fetchall()
         if request.method == "POST":
             now = datetime.now().isoformat(timespec="seconds")
             host = request.form["host"].strip()
             cur = conn.execute(
                 "INSERT INTO devices "
-                "(group_id, name, host, tags, snmp_cred_id, device_role, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(group_id, name, host, tags, snmp_cred_id, ssh_cred_id, device_role, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (request.form.get("group_id") or None,
                  request.form["name"].strip(), host,
                  request.form.get("tags", "").strip(),
                  request.form.get("snmp_cred_id") or None,
+                 request.form.get("ssh_cred_id") or None,
                  request.form.get("device_role") or None, now))
             did = cur.lastrowid
             conn.execute(
@@ -2806,6 +2987,7 @@ def device_new():
             return _flash_redirect(url_for("devices"), "Device added")
         body = render_template_string(DEVICE_FORM_HTML, device=None,
                                       groups=groups, snmp_creds=creds,
+                                      ssh_creds=ssh_creds,
                                       url_for=url_for)
         return render_ctx(body, "New device", "devices")
     finally:
@@ -2823,19 +3005,22 @@ def device_edit(did):
         if request.method == "POST":
             conn.execute(
                 "UPDATE devices SET group_id = ?, name = ?, host = ?, tags = ?, "
-                "snmp_cred_id = ?, device_role = ? WHERE id = ?",
+                "snmp_cred_id = ?, ssh_cred_id = ?, device_role = ? WHERE id = ?",
                 (request.form.get("group_id") or None,
                  request.form["name"].strip(),
                  request.form["host"].strip(),
                  request.form.get("tags", "").strip(),
                  request.form.get("snmp_cred_id") or None,
+                 request.form.get("ssh_cred_id") or None,
                  request.form.get("device_role") or None, did))
             conn.commit()
             return _flash_redirect(url_for("devices"), "Device updated")
         groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
         creds = conn.execute("SELECT * FROM snmp_credentials ORDER BY name").fetchall()
+        ssh_creds = conn.execute("SELECT id, name, profile FROM ssh_credentials ORDER BY name").fetchall()
         body = render_template_string(DEVICE_FORM_HTML, device=device,
-                                      groups=groups, snmp_creds=creds,
+                          groups=groups, snmp_creds=creds,
+                          ssh_creds=ssh_creds,
                                       url_for=url_for)
         return render_ctx(body, "Edit device", "devices")
     finally:
@@ -3005,6 +3190,119 @@ def snmp_creds_delete(cid):
 
 
 # ============================================================================
+# ROUTES — SSH SWITCH PROFILES
+# ============================================================================
+SSH_CREDS_HTML = """
+<div class="toolbar"><h1 style="margin:0">SSH Switch Profiles</h1>
+<span class="spacer"></span>
+<a class="btn" href="{{ url_for('ssh_creds_new') }}">+ Add SSH Profile</a></div>
+<div class="card">{% if rows %}<table>
+<tr><th>Name</th><th>Vendor profile</th><th>Username</th><th>SSH port</th><th>Devices</th><th></th></tr>
+{% for r in rows %}<tr><td><b>{{ r.name }}</b></td><td>{{ r.profile }}</td>
+<td>{{ r.username }}</td><td>{{ r.port }}</td><td>{{ r.device_count }}</td>
+<td><form method="post" action="{{ url_for('ssh_creds_delete', cid=r.id) }}"
+style="display:inline" onsubmit="return confirm('Delete this SSH profile?')">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<button class="btn red small">Delete</button></form></td></tr>{% endfor %}</table>
+{% else %}<p>No SSH profiles configured.</p>{% endif %}
+<p style="color:#6c757d;font-size:12px;margin-top:12px">
+Unknown SSH host keys are rejected. Pin the switch SHA-256 fingerprint here; passwords are not shown after saving.</p></div>
+"""
+
+
+@app.route("/ssh-profiles")
+@login_required
+def ssh_creds_page():
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT c.id, c.name, c.profile, c.username, c.port, "
+            "(SELECT COUNT(*) FROM devices WHERE ssh_cred_id = c.id) AS device_count "
+            "FROM ssh_credentials c ORDER BY c.name"
+        ).fetchall()
+    finally:
+        conn.close()
+    body = render_template_string(SSH_CREDS_HTML, rows=rows, url_for=url_for)
+    return render_ctx(body, "SSH Switch Profiles", "devices")
+
+
+SSH_CRED_FORM_HTML = """
+<h1>Add SSH Switch Profile</h1>
+<form method="post"><input type="hidden" name="_csrf_token" value="{{ csrf_token() }}"><div class="card">
+<div class="row"><div><label>Profile name</label><input name="name" required></div>
+<div><label>Vendor parser</label><select name="profile">
+{% for profile in profiles %}<option value="{{ profile }}">{{ profile }}</option>{% endfor %}
+</select></div><div><label>SSH port</label><input type="number" name="port" value="22" min="1" max="65535"></div></div>
+<div class="row"><div><label>Username</label><input name="username" required autocomplete="off"></div>
+<div><label>Password</label><input type="password" name="password" required autocomplete="new-password"></div></div>
+<div class="row"><div style="flex:2"><label>Host key SHA-256 fingerprint</label>
+<input name="host_key_sha256" required placeholder="SHA256:base64-fingerprint">
+<small>Verify this fingerprint through a trusted channel before saving.</small></div></div>
+<p style="font-size:12px;color:#6c757d">Use a read-only switch account. Credentials are stored in the application database; restrict database and backup access.</p>
+<button class="btn">Save profile</button>
+<a class="btn grey" href="{{ url_for('ssh_creds_page') }}">Cancel</a>
+</div></form>
+"""
+
+
+@app.route("/ssh-profiles/new", methods=["GET", "POST"])
+@login_required
+def ssh_creds_new():
+    profiles = sorted(SSH_PROFILE_REGISTRY)
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        profile = request.form.get("profile", "").strip()
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        fingerprint = request.form.get("host_key_sha256", "").strip()
+        if fingerprint.startswith("SHA256:"):
+            fingerprint = fingerprint[len("SHA256:"):]
+        fingerprint = fingerprint.rstrip("=")
+        try:
+            port = int(request.form.get("port") or 22)
+        except ValueError:
+            port = 0
+        if (not name or not username or not password or profile not in SSH_PROFILE_REGISTRY
+                or not 1 <= port <= 65535
+                or not re.fullmatch(r"[A-Za-z0-9+/]{43}", fingerprint)):
+            flash("Check required fields, supported profile, port, and SHA-256 fingerprint", "err")
+            return redirect(url_for("ssh_creds_new"))
+        conn = db()
+        try:
+            conn.execute(
+                "INSERT INTO ssh_credentials "
+                "(name, profile, username, password, port, host_key_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, profile, username, _encrypt_ssh_password(password), port, fingerprint,
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+            conn.commit()
+        except Exception:
+            flash("Could not save profile; check that its name is unique", "err")
+            return redirect(url_for("ssh_creds_new"))
+        finally:
+            conn.close()
+        return _flash_redirect(url_for("ssh_creds_page"), "SSH profile added")
+    body = render_template_string(
+        SSH_CRED_FORM_HTML, profiles=profiles, url_for=url_for,
+    )
+    return render_ctx(body, "New SSH profile", "devices")
+
+
+@app.route("/ssh-profiles/<int:cid>/delete", methods=["POST"])
+@login_required
+def ssh_creds_delete(cid):
+    conn = db()
+    try:
+        conn.execute("UPDATE devices SET ssh_cred_id = NULL WHERE ssh_cred_id = ?", (cid,))
+        conn.execute("DELETE FROM ssh_credentials WHERE id = ?", (cid,))
+        conn.commit()
+    finally:
+        conn.close()
+    return _flash_redirect(url_for("ssh_creds_page"), "SSH profile deleted")
+
+
+# ============================================================================
 # ROUTES — INTERFACES (with bulk import)
 # ============================================================================
 INTERFACES_HTML = """
@@ -3017,8 +3315,8 @@ INTERFACES_HTML = """
 </div>
 
 {% if not creds_ok %}
-<div class="flash err">No SNMP credentials attached.
-<a href="{{ url_for('device_edit', did=dev.id) }}">Attach credential</a> first.</div>
+<div class="flash err">No SNMP or SSH profile attached.
+<a href="{{ url_for('device_edit', did=dev.id) }}">Attach credentials</a> first.</div>
 {% elif err %}
 <div class="flash err">{{ err }}</div>
 {% else %}
@@ -3045,8 +3343,12 @@ Traffic (IN/OUT Mbps)
 </label>
 <label style="font-weight:600;margin-top:6px">
 <input type="checkbox" name="bulk_create_status" value="1">
-Status (up/down + errors)
+Status (up/down)
 </label></div>
+{% if ssh_mode %}<label style="font-weight:600;margin-top:6px">
+<input type="checkbox" name="bulk_create_errors" value="1">
+Port errors (per-poll delta)
+</label>{% endif %}</div>
 <div><label>Warning threshold (Mbps)</label>
 <input type="number" name="bulk_warn_mbps" value="800"
 placeholder="80% of link speed"></div>
@@ -3068,20 +3370,20 @@ placeholder="95% of link speed"></div>
 <th style="width:40px">
 <input type="checkbox" id="selectAll" onchange="toggleAll(this)">
 </th>
-<th>Idx</th><th>Name</th><th>Alias</th><th>Type</th>
+<th>{{ 'Port' if ssh_mode else 'Idx' }}</th><th>Name</th><th>Alias</th><th>Type</th>
 <th>Oper</th><th>Speed</th>
 </tr>
 {% for i in ifaces %}
 <tr>
 <td>
 <input type="checkbox" name="selected_if"
-value="{{ i.if_index }}|{{ i.name or i.descr or ('if' + i.if_index) }}|{{ i.alias or '' }}|{{ i.speed_mbps or '' }}"
+value="{{ i.if_index }}|{{ (i.name or i.descr or ('if' + i.if_index))|replace('|', '/') }}|{{ (i.alias or '')|replace('|', '/') }}|{{ i.speed_mbps or '' }}"
 class="if-checkbox">
 </td>
 <td>{{ i.if_index }}</td>
 <td><b>{{ i.name or i.descr or '—' }}</b></td>
 <td>{{ i.alias or '' }}</td>
-<td>{{ i.if_type or '' }}</td>
+<td>{{ i.if_type or ('SSH CLI' if ssh_mode else '') }}</td>
 <td>{% if i.oper_status == 'up' %}<span class="badge up">UP</span>
 {% elif i.oper_status %}<span class="badge down">{{ i.oper_status }}</span>{% endif %}</td>
 <td>{% if i.speed_mbps %}{{ i.speed_mbps }} Mbps{% else %}—{% endif %}</td>
@@ -3100,7 +3402,7 @@ function toggleAll(cb){
 </script>
 
 {% else %}
-<div class="card"><p>No interfaces detected. Check SNMP community / allow-list.</p></div>
+<div class="card"><p>No interfaces detected. Check the credential, host-key pin, and supported profile.</p></div>
 {% endif %}
 {% endif %}
 """
@@ -3112,9 +3414,13 @@ def device_interfaces(did):
     conn = db()
     try:
         dev = conn.execute(
-            "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port "
+            "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port, "
+            "sc.profile AS ssh_profile, sc.username AS ssh_username, "
+            "sc.password AS ssh_password, sc.port AS ssh_port, "
+            "sc.host_key_sha256 AS ssh_host_key_sha256 "
             "FROM devices d "
             "LEFT JOIN snmp_credentials c ON c.id = d.snmp_cred_id "
+            "LEFT JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "
             "WHERE d.id = ?", (did,)).fetchone()
         if not dev:
             abort(404)
@@ -3122,7 +3428,19 @@ def device_interfaces(did):
         conn.close()
 
     ifaces, sysname, sysdescr, err = [], "", "", None
-    if dev["community"]:
+    ssh_mode = bool(dev["ssh_username"])
+    if ssh_mode:
+        try:
+            ports = _ssh_for(dev, timeout=4).discover_ports()
+            ifaces = [{
+                "if_index": row["port"], "name": row["name"], "descr": row["name"],
+                "alias": "", "if_type": "SSH CLI", "oper_status": row["oper_status"],
+                "speed_mbps": None,
+            } for row in ports]
+            sysname = dev["name"]
+        except Exception as e:
+            err = "SSH port discovery failed: " + str(e)
+    elif dev["community"]:
         try:
             cli = _snmp_for(dev, timeout=4, retries=1)
             ifaces = discover_interfaces(cli, l3_only=False)
@@ -3133,7 +3451,8 @@ def device_interfaces(did):
 
     body = render_template_string(
         INTERFACES_HTML, dev=dev, ifaces=ifaces, sysname=sysname,
-        sysdescr=sysdescr, err=err, creds_ok=bool(dev["community"]),
+        sysdescr=sysdescr, err=err,
+        creds_ok=bool(dev["community"] or dev["ssh_username"]), ssh_mode=ssh_mode,
         url_for=url_for)
     return render_ctx(body, "Interfaces — " + dev["name"], "devices")
 
@@ -3141,13 +3460,31 @@ def device_interfaces(did):
 @app.route("/devices/<int:did>/interfaces/add", methods=["POST"])
 @login_required
 def device_interface_add_sensor(did):
+    check_conn = db()
     try:
-        if_index = int(request.form["if_index"])
-    except (KeyError, ValueError):
+        device_row = check_conn.execute(
+            "SELECT ssh_cred_id FROM devices WHERE id = ?", (did,)
+        ).fetchone()
+    finally:
+        check_conn.close()
+    ssh_mode = bool(device_row and device_row["ssh_cred_id"])
+    port_name = str(request.form.get("if_index", "")).strip()
+    if ssh_mode:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9/.-]*", port_name):
+            flash("Invalid switch port", "err")
+            return redirect(url_for("device_interfaces", did=did))
+        if_index = None
+    else:
+        try:
+            if_index = int(port_name)
+        except ValueError:
+            flash("Invalid interface", "err")
+            return redirect(url_for("device_interfaces", did=did))
+    if not port_name:
         flash("Invalid interface", "err")
         return redirect(url_for("device_interfaces", did=did))
 
-    if_name = (request.form.get("if_name") or ("if" + str(if_index))).strip()[:40]
+    if_name = (request.form.get("if_name") or (port_name if ssh_mode else "if" + str(if_index))).strip()[:40]
     alias = (request.form.get("if_alias") or "").strip()[:60]
     try:
         capacity_mbps = float(request.form.get("capacity_mbps") or 0)
@@ -3156,6 +3493,7 @@ def device_interface_add_sensor(did):
         capacity_mbps = None
     want_traffic = request.form.get("create_traffic") == "1"
     want_status = request.form.get("create_status") == "1"
+    want_errors = request.form.get("create_errors") == "1"
 
     try:
         warn_mbps = float(request.form["warn_mbps"]) \
@@ -3182,10 +3520,12 @@ def device_interface_add_sensor(did):
                 "timeout_seconds, retries, enabled, warning_latency_ms, "
                 "error_latency_ms, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (did, "Traffic " + if_name, "snmp_traffic",
-                 json.dumps({"if_index": if_index, "if_name": if_name,
-                             "if_alias": alias,
-                             "capacity_mbps": capacity_mbps}),
+                (did, "Traffic " + if_name,
+                 "ssh_traffic" if ssh_mode else "snmp_traffic",
+                 json.dumps({"port": port_name, "if_name": if_name}
+                            if ssh_mode else
+                            {"if_index": if_index, "if_name": if_name,
+                             "if_alias": alias, "capacity_mbps": capacity_mbps}),
                  interval, 5, 1, 1,
                  int(warn_mbps) if warn_mbps is not None else None,
                  int(err_mbps) if err_mbps is not None else None, now))
@@ -3195,9 +3535,21 @@ def device_interface_add_sensor(did):
                 "(device_id, name, sensor_type, params, interval_seconds, "
                 "timeout_seconds, retries, enabled, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (did, "Status " + if_name, "snmp_interface",
-                 json.dumps({"if_index": if_index, "if_name": if_name}),
+                (did, "Status " + if_name,
+                 "ssh_interface" if ssh_mode else "snmp_interface",
+                 json.dumps({"port": port_name, "if_name": if_name}
+                            if ssh_mode else {"if_index": if_index, "if_name": if_name}),
                  interval, 5, 1, 1, now))
+        if want_errors and ssh_mode:
+            conn.execute(
+                "INSERT INTO sensors "
+                "(device_id, name, sensor_type, params, interval_seconds, "
+                "timeout_seconds, retries, enabled, warning_latency_ms, "
+                "error_latency_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (did, "Errors " + if_name, "ssh_errors",
+                 json.dumps({"port": port_name, "if_name": if_name}),
+                 interval, 5, 1, 1, 1, 10, now))
         conn.commit()
     finally:
         conn.close()
@@ -3216,7 +3568,18 @@ def device_interface_bulk_add(did):
 
     want_traffic = request.form.get("bulk_create_traffic") == "1"
     want_status = request.form.get("bulk_create_status") == "1"
-    if not (want_traffic or want_status):
+    want_errors = request.form.get("bulk_create_errors") == "1"
+    conn = db()
+    try:
+        device_row = conn.execute(
+            "SELECT ssh_cred_id FROM devices WHERE id = ?", (did,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not device_row:
+        abort(404)
+    ssh_mode = bool(device_row["ssh_cred_id"])
+    if not (want_traffic or want_status or (ssh_mode and want_errors)):
         flash("Select at least one sensor type", "err")
         return redirect(url_for("device_interfaces", did=did))
 
@@ -3243,10 +3606,16 @@ def device_interface_bulk_add(did):
             parts = entry.split("|", 3)
             if len(parts) < 2:
                 continue
-            try:
-                if_index = int(parts[0])
-            except ValueError:
-                continue
+            port_name = parts[0].strip()
+            if ssh_mode:
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9/.-]*", port_name):
+                    continue
+                if_index = None
+            else:
+                try:
+                    if_index = int(port_name)
+                except ValueError:
+                    continue
             if_name = parts[1][:40]
             alias = (parts[2] if len(parts) > 2 else "")[:60]
             try:
@@ -3256,38 +3625,58 @@ def device_interface_bulk_add(did):
                 capacity_mbps = None
 
             def sensor_exists(stype):
-                row = conn.execute(
-                    "SELECT COUNT(*) AS c FROM sensors "
-                    "WHERE device_id = ? AND sensor_type = ? AND params LIKE ?",
-                    (did, stype, '%"if_index": ' + str(if_index) + '%'),
-                ).fetchone()
-                return row["c"] > 0
+                rows = conn.execute(
+                    "SELECT params FROM sensors WHERE device_id = ? AND sensor_type = ?",
+                    (did, stype),
+                ).fetchall()
+                key, target = ("port", port_name) if ssh_mode else ("if_index", if_index)
+                for row in rows:
+                    try:
+                        if json.loads(row["params"] or "{}").get(key) == target:
+                            return True
+                    except (ValueError, TypeError):
+                        continue
+                return False
 
-            if want_traffic and not sensor_exists("snmp_traffic"):
+            traffic_type = "ssh_traffic" if ssh_mode else "snmp_traffic"
+            status_type = "ssh_interface" if ssh_mode else "snmp_interface"
+            params = ({"port": port_name, "if_name": if_name} if ssh_mode else
+                      {"if_index": if_index, "if_name": if_name,
+                       "if_alias": alias, "capacity_mbps": capacity_mbps})
+            if want_traffic and not sensor_exists(traffic_type):
                 conn.execute(
                     "INSERT INTO sensors "
                     "(device_id, name, sensor_type, params, interval_seconds, "
                     "timeout_seconds, retries, enabled, warning_latency_ms, "
                     "error_latency_ms, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (did, "Traffic " + if_name, "snmp_traffic",
-                     json.dumps({"if_index": if_index, "if_name": if_name,
-                                 "if_alias": alias,
-                                 "capacity_mbps": capacity_mbps}),
+                    (did, "Traffic " + if_name, traffic_type, json.dumps(params),
                      interval, 5, 1, 1,
                      int(warn_mbps) if warn_mbps is not None else None,
                      int(err_mbps) if err_mbps is not None else None, now))
                 created += 1
 
-            if want_status and not sensor_exists("snmp_interface"):
+            if want_status and not sensor_exists(status_type):
                 conn.execute(
                     "INSERT INTO sensors "
                     "(device_id, name, sensor_type, params, interval_seconds, "
                     "timeout_seconds, retries, enabled, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (did, "Status " + if_name, "snmp_interface",
-                     json.dumps({"if_index": if_index, "if_name": if_name}),
+                    (did, "Status " + if_name, status_type,
+                     json.dumps({"port": port_name, "if_name": if_name}
+                                if ssh_mode else {"if_index": if_index, "if_name": if_name}),
                      interval, 5, 1, 1, now))
+                created += 1
+            if ssh_mode and want_errors and not sensor_exists("ssh_errors"):
+                conn.execute(
+                    "INSERT INTO sensors "
+                    "(device_id, name, sensor_type, params, interval_seconds, "
+                    "timeout_seconds, retries, enabled, warning_latency_ms, "
+                    "error_latency_ms, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (did, "Errors " + if_name, "ssh_errors",
+                     json.dumps({"port": port_name, "if_name": if_name}),
+                     interval, 5, 1, 1, 1, 10, now))
                 created += 1
         conn.commit()
     finally:
@@ -3312,7 +3701,7 @@ TRAFFIC_HTML = """
 <div class="sensor-card {{ r.status or 'paused' }}" id="traffic-card-{{ r.id }}">
 <h3>{{ r.name }}</h3>
 <div class="meta">{{ r.gname or '—' }} / {{ r.dname }} ({{ r.host }})</div>
-{% if r.sensor_type == 'snmp_traffic' %}
+{% if r.sensor_type in ['snmp_traffic','ssh_traffic'] %}
 <div style="display:flex;gap:14px;font-weight:800">
 <div><div style="font-size:10px;color:#5b6b7b">IN</div>
 <div style="color:#0a66c2">
@@ -3363,7 +3752,7 @@ async function refreshTraffic(){
             if(msg)msg.textContent=s.message||'';
             const ts=document.getElementById('traffic-ts-'+s.id);
             if(ts)ts.textContent=s.timestamp||'';
-            if(s.sensor_type==='snmp_traffic'){
+            if(s.sensor_type==='snmp_traffic'||s.sensor_type==='ssh_traffic'){
                 const inEl=document.getElementById('traffic-in-'+s.id);
                 const outEl=document.getElementById('traffic-out-'+s.id);
                 const utilEl=document.getElementById('traffic-util-'+s.id);
@@ -3409,7 +3798,8 @@ def traffic_dashboard():
             "JOIN devices d ON d.id = s.device_id "
             "LEFT JOIN groups g ON g.id = d.group_id "
             "WHERE s.sensor_type IN "
-            "('snmp_traffic', 'snmp_interface', 'firewall_health', 'snmp_storage') "
+            "('snmp_traffic', 'snmp_interface', 'ssh_traffic', 'ssh_interface', "
+            "'ssh_errors', 'firewall_health', 'snmp_storage') "
             "ORDER BY g.name, d.name, s.name").fetchall()
     finally:
         conn.close()
@@ -3428,7 +3818,8 @@ def api_traffic():
             "FROM sensors s LEFT JOIN sensor_data sd ON sd.id = "
             "(SELECT MAX(id) FROM sensor_data WHERE sensor_id = s.id) "
             "WHERE s.sensor_type IN "
-            "('snmp_traffic', 'snmp_interface', 'firewall_health', 'snmp_storage') "
+            "('snmp_traffic', 'snmp_interface', 'ssh_traffic', 'ssh_interface', "
+            "'ssh_errors', 'firewall_health', 'snmp_storage') "
             "ORDER BY s.id"
         ).fetchall()
     finally:
@@ -3500,7 +3891,7 @@ SENSOR_FORM_HTML = """
 <input name="name" required value="{{ sensor.name if sensor else '' }}"></div>
 <div><label>Type</label>
 <select name="sensor_type" id="stype" onchange="updateTypeFields()">
-{% for t in ['ping','tcp','http','https','dns','snmp_traffic','snmp_interface','snmp_storage','firewall_health'] %}
+{% for t in ['ping','tcp','http','https','dns','snmp_traffic','snmp_interface','snmp_storage','ssh_traffic','ssh_interface','ssh_errors','firewall_health'] %}
 <option value="{{ t }}" {{ 'selected' if sensor and sensor.sensor_type==t }}>{{ t }}</option>
 {% endfor %}</select></div></div>
 <div class="row" id="typeRow">
@@ -3512,6 +3903,9 @@ placeholder="https://example.com/health"></div>
 <div id="ifField" style="display:none;flex:2"><label>Interface Index</label>
 <input name="if_index" id="if_index"
 value="{{ params.if_index if params and params.if_index else '' }}"></div>
+<div id="sshPortField" style="display:none;flex:2"><label>Switch port name</label>
+<input name="switch_port" id="switch_port"
+value="{{ params.port if params and params.port else '' }}" placeholder="Gi1/0/1"></div>
 <div id="capacityField" style="display:none"><label>Link capacity (Mbps)</label>
 <input type="number" min="0.1" step="any" name="capacity_mbps"
 value="{{ params.capacity_mbps if params and params.capacity_mbps else '' }}"
@@ -3556,18 +3950,25 @@ function updateTypeFields(){
   const t=document.getElementById('stype').value;
   document.getElementById('portField').style.display=(t==='tcp')?'block':'none';
   document.getElementById('urlField').style.display=(t==='http'||t==='https')?'block':'none';
-  document.getElementById('ifField').style.display=(t==='snmp_traffic'||t==='snmp_interface')?'block':'none';
+    document.getElementById('ifField').style.display=(t==='snmp_traffic'||t==='snmp_interface')?'block':'none';
+        document.getElementById('sshPortField').style.display=(t==='ssh_traffic'||t==='ssh_interface'||t==='ssh_errors')?'block':'none';
     document.getElementById('capacityField').style.display=(t==='snmp_traffic')?'block':'none';
     document.getElementById('storageField').style.display=(t==='snmp_storage')?'block':'none';
     document.getElementById('storageDescField').style.display=(t==='snmp_storage')?'block':'none';
   document.getElementById('vendorField').style.display=(t==='firewall_health')?'block':'none';
-    document.getElementById('warningLabel').textContent=t==='snmp_storage'?'Warning (%)':'Warning threshold';
-    document.getElementById('errorLabel').textContent=t==='snmp_storage'?'Critical (%)':'Error threshold';
+    document.getElementById('warningLabel').textContent=t==='snmp_storage'?'Warning (%)':(t==='ssh_errors'?'Warning (new errors/poll)':((t==='ssh_traffic')?'Warning (Mbps)':'Warning threshold'));
+    document.getElementById('errorLabel').textContent=t==='snmp_storage'?'Critical (%)':(t==='ssh_errors'?'Critical (new errors/poll)':((t==='ssh_traffic')?'Critical (Mbps)':'Error threshold'));
     if(t==='snmp_storage'){
         const warning=document.querySelector('[name="warning_latency_ms"]');
         const critical=document.querySelector('[name="error_latency_ms"]');
         if(warning.value==='100')warning.value='80';
         if(critical.value==='300')critical.value='90';
+    }
+    if(t==='ssh_errors'){
+        const warning=document.querySelector('[name="warning_latency_ms"]');
+        const critical=document.querySelector('[name="error_latency_ms"]');
+        if(warning.value==='100')warning.value='1';
+        if(critical.value==='300')critical.value='10';
     }
 }
 updateTypeFields();
@@ -3592,6 +3993,9 @@ def _parse_sensor_form():
             params["if_index"] = int(request.form.get("if_index") or 0)
         except ValueError:
             params["if_index"] = 0
+    if st in ("ssh_traffic", "ssh_interface", "ssh_errors"):
+        params["port"] = request.form.get("switch_port", "").strip()[:40]
+        params["if_name"] = params["port"]
     if st == "snmp_traffic":
         try:
             capacity_mbps = float(request.form.get("capacity_mbps") or 0)

@@ -66,6 +66,7 @@ $RequiredFiles = @(
     "itechkey_background.py",
     "itechkey_collector.py",
     "itechkey_snmp.py",
+    "itechkey_ssh.py",
     "itechkey_setup.py",
     "requirements.txt"
 )

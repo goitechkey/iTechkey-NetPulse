@@ -67,6 +67,7 @@ REQUIRED_FILES=(
     "itechkey_monitor.py"
     "itechkey_collector.py"
     "itechkey_snmp.py"
+    "itechkey_ssh.py"
     "itechkey_setup.py"
     "requirements.txt"
 )

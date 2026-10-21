@@ -71,6 +71,12 @@ In elevated PowerShell, use `Get-ScheduledTask -TaskName 'iTechkey NetPulse Moni
 4. Add device — **Devices → + Add Device** (attach SNMP credential)
 5. Discover interfaces — **Devices → Interfaces button**
 6. Create traffic sensors — pick interfaces, add Traffic + Status sensors
+
+### SSH-only L2 switch monitoring
+
+For switches where SNMP is unavailable, install the current requirements and open **Devices → SSH Profiles**. Create a profile with a read-only switch account, select the vendor parser, and enter the switch SSH host-key SHA-256 fingerprint after verifying it through a trusted channel. SSH connections reject unpinned host keys. Profile passwords are encrypted at rest using the application secret key; preserve the protected application key when restoring a database backup.
+
+Attach the profile to a switch in **Devices → Edit**, then open that device's **Interfaces** page. The initial parser is `cisco_ios` and uses `show interfaces status` for discovery and `show interfaces <port>` for monitoring. Bulk-add Traffic, Status, and optional Port errors sensors. Traffic uses the switch-reported five-minute input/output rates in Mbps; errors are counter deltas per poll (the first poll is the baseline). SSH profiles are registered through `register_ssh_profile()` in `itechkey_ssh.py`; each vendor adapter supplies its fixed discovery command, validated per-port command, and output parsers. Keep commands read-only and add representative captured-output parser tests before enabling a new adapter.
 7. Set alert rules — **Alerts → + Add Rule**
 
 ## SNMP Setup on Devices
