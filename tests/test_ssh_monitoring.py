@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ import itechkey_monitor as monitor
 from itechkey_ssh import (
     SSHError,
     SSH_PROFILE_REGISTRY,
+    _ExpectedHostKeyPolicy,
     register_ssh_profile,
     parse_cisco_interface_details,
     parse_cisco_interface_status,
@@ -152,11 +155,62 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
         finally:
             conn.close()
 
+    def test_legacy_profile_key_moves_to_the_attached_device(self):
+        conn = monitor.db()
+        try:
+            credential_id = conn.execute(
+                "INSERT INTO ssh_credentials "
+                "(name, profile, username, password, port, host_key_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("Legacy switch", "cisco_ios", "monitor", "encrypted", 22,
+                 "A" * 43, "2026-01-01T00:00:00"),
+            ).lastrowid
+            device_id = conn.execute(
+                "INSERT INTO devices (name, host, ssh_cred_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("Switch", "192.0.2.10", credential_id, "2026-01-01T00:00:00"),
+            ).lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+
+        monitor.init_db()
+        conn = monitor.db()
+        try:
+            device_key = conn.execute(
+                "SELECT ssh_host_key_sha256 FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()["ssh_host_key_sha256"]
+            profile_key = conn.execute(
+                "SELECT host_key_sha256 FROM ssh_credentials WHERE id = ?", (credential_id,)
+            ).fetchone()["host_key_sha256"]
+            self.assertEqual(device_key, "A" * 43)
+            self.assertEqual(profile_key, "")
+        finally:
+            conn.close()
+
     def test_ssh_password_is_encrypted_and_round_trips(self):
         encrypted = monitor._encrypt_ssh_password("switch-secret")
         self.assertNotIn("switch-secret", encrypted)
         self.assertTrue(encrypted.startswith("fernet:"))
         self.assertEqual(monitor._decrypt_ssh_password(encrypted), "switch-secret")
+
+    def test_first_ssh_connection_learns_a_key_and_later_key_changes_are_rejected(self):
+        class FakeKey:
+            def asbytes(self):
+                return b"switch-host-key"
+
+        fingerprint = base64.b64encode(
+            hashlib.sha256(FakeKey().asbytes()).digest()
+        ).decode().rstrip("=")
+        first_connection = _ExpectedHostKeyPolicy(trust_on_first_use=True)
+        first_connection.missing_host_key(None, "switch", FakeKey())
+        self.assertEqual(first_connection.observed_fingerprint, fingerprint)
+
+        changed_key = _ExpectedHostKeyPolicy(fingerprint)
+        with self.assertRaises(SSHError):
+            changed_key.missing_host_key(None, "switch", type("OtherKey", (), {
+                "asbytes": lambda self: b"different-host-key",
+            })())
 
     def test_ssh_profile_form_saves_credentials_and_never_lists_password(self):
         monitor.set_setting("force_password_change", "0")
@@ -166,19 +220,21 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
             state["_csrf_token"] = "test-token"
         page = client.get("/ssh-profiles/new")
         self.assertEqual(page.status_code, 200)
+        self.assertNotIn(b"Host key SHA-256 fingerprint", page.data)
         response = client.post("/ssh-profiles/new", data={
             "_csrf_token": "test-token", "name": "Lab Cisco", "profile": "cisco_ios",
             "username": "monitor", "password": "switch-secret", "port": "22",
-            "host_key_sha256": "A" * 43,
         })
         self.assertEqual(response.status_code, 302)
         conn = monitor.db()
         try:
             stored = conn.execute(
-                "SELECT password FROM ssh_credentials WHERE name = ?", ("Lab Cisco",)
-            ).fetchone()["password"]
-            self.assertNotEqual(stored, "switch-secret")
-            self.assertEqual(monitor._decrypt_ssh_password(stored), "switch-secret")
+                "SELECT password, host_key_sha256 FROM ssh_credentials WHERE name = ?",
+                ("Lab Cisco",),
+            ).fetchone()
+            self.assertNotEqual(stored["password"], "switch-secret")
+            self.assertEqual(monitor._decrypt_ssh_password(stored["password"]), "switch-secret")
+            self.assertEqual(stored["host_key_sha256"], "")
         finally:
             conn.close()
         listing = client.get("/ssh-profiles")
@@ -193,7 +249,7 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
                 "(name, profile, username, password, port, host_key_sha256, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ("Test switch", "cisco_ios", "monitor",
-                 monitor._encrypt_ssh_password("switch-secret"), 22, "A" * 43,
+                 monitor._encrypt_ssh_password("switch-secret"), 22, "",
                  "2026-01-01T00:00:00"),
             ).lastrowid
             conn.commit()
@@ -221,6 +277,8 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
             conn.close()
 
         class MockSSHClient:
+            trusted_host_key = "B" * 43
+
             def discover_ports(self):
                 return [{"port": "Gi1/0/1", "name": "Uplink", "oper_status": "connected"}]
 
@@ -228,6 +286,14 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
             page = client.get("/devices/%d/interfaces" % device_id)
         self.assertEqual(page.status_code, 200)
         self.assertIn(b"Gi1/0/1", page.data)
+        conn = monitor.db()
+        try:
+            saved_key = conn.execute(
+                "SELECT ssh_host_key_sha256 FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()["ssh_host_key_sha256"]
+            self.assertEqual(saved_key, "B" * 43)
+        finally:
+            conn.close()
 
         response = client.post("/devices/%d/interfaces/bulk-add" % device_id, data={
             "_csrf_token": "test-token", "selected_if": "Gi1/0/1|Uplink||",

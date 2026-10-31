@@ -247,7 +247,7 @@ CREATE TABLE IF NOT EXISTS ssh_credentials (
     username TEXT NOT NULL,
     password TEXT,
     port INTEGER DEFAULT 22,
-    host_key_sha256 TEXT NOT NULL,
+    host_key_sha256 TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices (
@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS devices (
     group_id INTEGER,
     snmp_cred_id INTEGER,
     ssh_cred_id INTEGER,
+    ssh_host_key_sha256 TEXT NOT NULL DEFAULT '',
     device_role TEXT,
     name TEXT NOT NULL,
     host TEXT NOT NULL,
@@ -355,7 +356,7 @@ CREATE TABLE IF NOT EXISTS ssh_credentials (
     username VARCHAR(150) NOT NULL,
     password TEXT,
     port INT DEFAULT 22,
-    host_key_sha256 VARCHAR(100) NOT NULL,
+    host_key_sha256 VARCHAR(100) NOT NULL DEFAULT '',
     created_at VARCHAR(32) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -364,6 +365,7 @@ CREATE TABLE IF NOT EXISTS devices (
     group_id INT,
     snmp_cred_id INT,
     ssh_cred_id INT,
+    ssh_host_key_sha256 VARCHAR(100) NOT NULL DEFAULT '',
     device_role VARCHAR(32),
     name VARCHAR(150) NOT NULL,
     host VARCHAR(150) NOT NULL,
@@ -600,18 +602,50 @@ def init_db():
                 conn.execute("ALTER TABLE " + table + " ADD COLUMN " + col + " " + decl)
         _ensure_col("devices", "snmp_cred_id", "INTEGER")
         _ensure_col("devices", "ssh_cred_id", "INTEGER")
+        _ensure_col("devices", "ssh_host_key_sha256", "TEXT NOT NULL DEFAULT ''")
         _ensure_col("devices", "device_role", "TEXT")
         _ensure_col("sensor_data", "value_in", "REAL")
         _ensure_col("sensor_data", "value_out", "REAL")
         _ensure_col("sensor_data", "meta", "TEXT")
     else:
-        column = conn.execute(
-            "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'devices' "
-            "AND COLUMN_NAME = 'ssh_cred_id'"
-        ).fetchone()
-        if not column or not column["c"]:
-            conn.execute("ALTER TABLE devices ADD COLUMN ssh_cred_id INT NULL")
+        for col, definition in (
+            ("ssh_cred_id", "INT NULL"),
+            ("ssh_host_key_sha256", "VARCHAR(100) NOT NULL DEFAULT ''"),
+        ):
+            column = conn.execute(
+                "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'devices' "
+                "AND COLUMN_NAME = ?", (col,)
+            ).fetchone()
+            if not column or not column["c"]:
+                conn.execute("ALTER TABLE devices ADD COLUMN " + col + " " + definition)
+
+    # Older versions stored a pin on the reusable profile. Copy it to each
+    # attached device once, so profiles can now be shared safely.
+    if DB_BACKEND == "mysql":
+        conn.execute(
+            "UPDATE devices d JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "
+            "SET d.ssh_host_key_sha256 = sc.host_key_sha256 "
+            "WHERE (d.ssh_host_key_sha256 IS NULL OR d.ssh_host_key_sha256 = '') "
+            "AND sc.host_key_sha256 <> ''"
+        )
+    else:
+        conn.execute(
+            "UPDATE devices SET ssh_host_key_sha256 = ("
+            "SELECT host_key_sha256 FROM ssh_credentials "
+            "WHERE ssh_credentials.id = devices.ssh_cred_id) "
+            "WHERE (ssh_host_key_sha256 IS NULL OR ssh_host_key_sha256 = '') "
+            "AND EXISTS (SELECT 1 FROM ssh_credentials "
+            "WHERE ssh_credentials.id = devices.ssh_cred_id "
+            "AND ssh_credentials.host_key_sha256 <> '')"
+        )
+    # Profiles are reusable credentials; the pin now belongs to a particular
+    # device. Clearing the legacy value also lets a user re-trust a replaced
+    # switch without an old profile-level pin being restored at next startup.
+    conn.execute(
+        "UPDATE ssh_credentials SET host_key_sha256 = '' "
+        "WHERE host_key_sha256 <> ''"
+    )
 
     row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
     created_default_admin = bool(row and row["c"] == 0)
@@ -869,8 +903,7 @@ def _sensor_device_ctx(sensor_row):
         return conn.execute(
             "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port, "
             "sc.profile AS ssh_profile, sc.username AS ssh_username, "
-            "sc.password AS ssh_password, sc.port AS ssh_port, "
-            "sc.host_key_sha256 AS ssh_host_key_sha256 "
+            "sc.password AS ssh_password, sc.port AS ssh_port "
             "FROM devices d "
             "LEFT JOIN snmp_credentials c ON c.id = d.snmp_cred_id "
             "LEFT JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "
@@ -900,13 +933,32 @@ def _snmp_for(dev, timeout=5, retries=1):
 def _ssh_for(dev, timeout=10):
     if not dev or not dev["ssh_username"]:
         raise SSHError("Device has no SSH profile attached")
+    expected_host_key = dev["ssh_host_key_sha256"] or ""
     return SSHSwitchClient(
         dev["host"], username=dev["ssh_username"],
         password=_decrypt_ssh_password(dev["ssh_password"]),
         port=dev["ssh_port"] or 22, timeout=timeout,
         profile=dev["ssh_profile"] or "cisco_ios",
-        expected_host_key=dev["ssh_host_key_sha256"],
+        expected_host_key=expected_host_key,
+        trust_on_first_use=not bool(expected_host_key),
     )
+
+
+def _save_trusted_ssh_host_key(dev, client):
+    """Persist a first-use SSH host key on the individual device, not its profile."""
+    fingerprint = getattr(client, "trusted_host_key", "")
+    if not fingerprint or dev["ssh_host_key_sha256"]:
+        return
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE devices SET ssh_host_key_sha256 = ? "
+            "WHERE id = ? AND (ssh_host_key_sha256 IS NULL OR ssh_host_key_sha256 = '')",
+            (fingerprint, dev["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _ssh_password_cipher():
@@ -1160,7 +1212,9 @@ def _ssh_port_details(sensor_row):
         raise SSHError("No switch port configured")
     dev = _sensor_device_ctx(sensor_row)
     client = _ssh_for(dev, timeout=sensor_row["timeout_seconds"] or 10)
-    return client.port_details(port)
+    details = client.port_details(port)
+    _save_trusted_ssh_host_key(dev, client)
+    return details
 
 
 def check_ssh_interface(sensor_row):
@@ -2942,7 +2996,11 @@ DEVICE_FORM_HTML = """
 {% for c in ssh_creds %}
 <option value="{{ c.id }}" {{ 'selected' if device and device.ssh_cred_id==c.id }}>{{ c.name }} ({{ c.profile }})</option>
 {% endfor %}</select>
-<small><a href="{{ url_for('ssh_creds_page') }}">Manage SSH profiles and credentials</a></small></div></div>
+<small><a href="{{ url_for('ssh_creds_page') }}">Manage SSH profiles and credentials</a></small>
+{% if device and device.ssh_cred_id %}<label style="font-weight:600;margin-top:8px">
+<input type="checkbox" name="reset_ssh_host_key" value="1"> Trust SSH key again on next connection</label>
+<small>Use this only after replacing the switch or its SSH host key.</small>{% endif %}
+</div></div>
 <div class="row">
 <div><label>Tags</label>
 <input name="tags" value="{{ device.tags if device else '' }}"></div></div>
@@ -2984,7 +3042,11 @@ def device_new():
                  DEFAULT_INTERVAL, DEFAULT_TIMEOUT, DEFAULT_RETRIES,
                  1, 100, 300, now))
             conn.commit()
-            return _flash_redirect(url_for("devices"), "Device added")
+            message = (
+                "Device added — open Interfaces to connect and trust its SSH key"
+                if request.form.get("ssh_cred_id") else "Device added"
+            )
+            return _flash_redirect(url_for("devices"), message)
         body = render_template_string(DEVICE_FORM_HTML, device=None,
                                       groups=groups, snmp_creds=creds,
                                       ssh_creds=ssh_creds,
@@ -3003,15 +3065,29 @@ def device_edit(did):
         if not device:
             abort(404)
         if request.method == "POST":
+            host = request.form["host"].strip()
+            ssh_cred_raw = request.form.get("ssh_cred_id") or ""
+            try:
+                ssh_cred_id = int(ssh_cred_raw) if ssh_cred_raw else None
+            except ValueError:
+                flash("Invalid SSH profile", "err")
+                return redirect(url_for("device_edit", did=did))
+            re_trust_ssh = (
+                request.form.get("reset_ssh_host_key") == "1"
+                or host != device["host"]
+                or ssh_cred_id != device["ssh_cred_id"]
+            )
             conn.execute(
                 "UPDATE devices SET group_id = ?, name = ?, host = ?, tags = ?, "
-                "snmp_cred_id = ?, ssh_cred_id = ?, device_role = ? WHERE id = ?",
+                "snmp_cred_id = ?, ssh_cred_id = ?, ssh_host_key_sha256 = ?, "
+                "device_role = ? WHERE id = ?",
                 (request.form.get("group_id") or None,
                  request.form["name"].strip(),
-                 request.form["host"].strip(),
+                 host,
                  request.form.get("tags", "").strip(),
                  request.form.get("snmp_cred_id") or None,
-                 request.form.get("ssh_cred_id") or None,
+                 ssh_cred_id,
+                 "" if re_trust_ssh else device["ssh_host_key_sha256"],
                  request.form.get("device_role") or None, did))
             conn.commit()
             return _flash_redirect(url_for("devices"), "Device updated")
@@ -3206,7 +3282,7 @@ style="display:inline" onsubmit="return confirm('Delete this SSH profile?')">
 <button class="btn red small">Delete</button></form></td></tr>{% endfor %}</table>
 {% else %}<p>No SSH profiles configured.</p>{% endif %}
 <p style="color:#6c757d;font-size:12px;margin-top:12px">
-Unknown SSH host keys are rejected. Pin the switch SHA-256 fingerprint here; passwords are not shown after saving.</p></div>
+Enter only the SSH username and password. On the first successful connection, the switch key is trusted and saved for that device; later connections verify it. Passwords are not shown after saving.</p></div>
 """
 
 
@@ -3235,10 +3311,7 @@ SSH_CRED_FORM_HTML = """
 </select></div><div><label>SSH port</label><input type="number" name="port" value="22" min="1" max="65535"></div></div>
 <div class="row"><div><label>Username</label><input name="username" required autocomplete="off"></div>
 <div><label>Password</label><input type="password" name="password" required autocomplete="new-password"></div></div>
-<div class="row"><div style="flex:2"><label>Host key SHA-256 fingerprint</label>
-<input name="host_key_sha256" required placeholder="SHA256:base64-fingerprint">
-<small>Verify this fingerprint through a trusted channel before saving.</small></div></div>
-<p style="font-size:12px;color:#6c757d">Use a read-only switch account. Credentials are stored in the application database; restrict database and backup access.</p>
+<p style="font-size:12px;color:#6c757d">Use a read-only switch account. After attaching this profile to a device, open that device's Interfaces page to connect and trust its SSH key automatically. Credentials are stored in the application database; restrict database and backup access.</p>
 <button class="btn">Save profile</button>
 <a class="btn grey" href="{{ url_for('ssh_creds_page') }}">Cancel</a>
 </div></form>
@@ -3254,18 +3327,13 @@ def ssh_creds_new():
         profile = request.form.get("profile", "").strip()
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        fingerprint = request.form.get("host_key_sha256", "").strip()
-        if fingerprint.startswith("SHA256:"):
-            fingerprint = fingerprint[len("SHA256:"):]
-        fingerprint = fingerprint.rstrip("=")
         try:
             port = int(request.form.get("port") or 22)
         except ValueError:
             port = 0
         if (not name or not username or not password or profile not in SSH_PROFILE_REGISTRY
-                or not 1 <= port <= 65535
-                or not re.fullmatch(r"[A-Za-z0-9+/]{43}", fingerprint)):
-            flash("Check required fields, supported profile, port, and SHA-256 fingerprint", "err")
+                or not 1 <= port <= 65535):
+            flash("Check the profile name, username, password, supported parser, and SSH port", "err")
             return redirect(url_for("ssh_creds_new"))
         conn = db()
         try:
@@ -3273,7 +3341,7 @@ def ssh_creds_new():
                 "INSERT INTO ssh_credentials "
                 "(name, profile, username, password, port, host_key_sha256, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, profile, username, _encrypt_ssh_password(password), port, fingerprint,
+                (name, profile, username, _encrypt_ssh_password(password), port, "",
                  datetime.now().isoformat(timespec="seconds")),
             )
             conn.commit()
@@ -3402,7 +3470,7 @@ function toggleAll(cb){
 </script>
 
 {% else %}
-<div class="card"><p>No interfaces detected. Check the credential, host-key pin, and supported profile.</p></div>
+<div class="card"><p>No interfaces detected. Check the SSH username, password, switch reachability, and supported profile.</p></div>
 {% endif %}
 {% endif %}
 """
@@ -3416,8 +3484,7 @@ def device_interfaces(did):
         dev = conn.execute(
             "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port, "
             "sc.profile AS ssh_profile, sc.username AS ssh_username, "
-            "sc.password AS ssh_password, sc.port AS ssh_port, "
-            "sc.host_key_sha256 AS ssh_host_key_sha256 "
+            "sc.password AS ssh_password, sc.port AS ssh_port "
             "FROM devices d "
             "LEFT JOIN snmp_credentials c ON c.id = d.snmp_cred_id "
             "LEFT JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "
@@ -3431,7 +3498,9 @@ def device_interfaces(did):
     ssh_mode = bool(dev["ssh_username"])
     if ssh_mode:
         try:
-            ports = _ssh_for(dev, timeout=4).discover_ports()
+            ssh_client = _ssh_for(dev, timeout=4)
+            ports = ssh_client.discover_ports()
+            _save_trusted_ssh_host_key(dev, ssh_client)
             ifaces = [{
                 "if_index": row["port"], "name": row["name"], "descr": row["name"],
                 "alias": "", "if_type": "SSH CLI", "oper_status": row["oper_status"],

@@ -111,23 +111,33 @@ def register_ssh_profile(profile_id, profile_factory):
 
 
 class _ExpectedHostKeyPolicy(paramiko.MissingHostKeyPolicy if paramiko else object):
-    def __init__(self, expected_fingerprint):
+    """Verify a saved key, or learn one during an explicit first connection."""
+
+    def __init__(self, expected_fingerprint="", trust_on_first_use=False):
         fingerprint = (expected_fingerprint or "").replace("SHA256:", "").strip()
         self.expected_fingerprint = fingerprint.rstrip("=")
+        self.trust_on_first_use = bool(trust_on_first_use)
+        self.observed_fingerprint = ""
 
     def missing_host_key(self, _client, hostname, key):
         import base64
         import hashlib
         actual = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
-        if not self.expected_fingerprint or actual != self.expected_fingerprint:
-            raise SSHError("SSH host key is not trusted; configure its SHA256 fingerprint")
+        if self.expected_fingerprint:
+            if actual != self.expected_fingerprint:
+                raise SSHError(
+                    "SSH host key changed; edit the device and choose Trust SSH key again"
+                )
+        elif not self.trust_on_first_use:
+            raise SSHError("SSH host key is not trusted")
+        self.observed_fingerprint = actual
 
 
 class SSHSwitchClient:
-    """Bounded SSH client for read-only switch commands with strict host-key checks."""
+    """Bounded SSH client for read-only commands with pinned SSH host keys."""
 
     def __init__(self, host, username, password=None, port=22, timeout=10,
-                 profile="cisco_ios", expected_host_key=""):
+                 profile="cisco_ios", expected_host_key="", trust_on_first_use=False):
         self.host = host
         self.username = username
         self.password = password
@@ -139,12 +149,17 @@ class SSHSwitchClient:
             raise SSHError("Unsupported SSH switch profile: " + self.profile_name)
         self.profile = factory()
         self.expected_host_key = expected_host_key
+        self.trust_on_first_use = bool(trust_on_first_use)
+        self.trusted_host_key = ""
 
     def _run(self, command):
         if paramiko is None:
             raise SSHError("SSH support is unavailable; install Paramiko")
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(_ExpectedHostKeyPolicy(self.expected_host_key))
+        host_key_policy = _ExpectedHostKeyPolicy(
+            self.expected_host_key, trust_on_first_use=self.trust_on_first_use,
+        )
+        client.set_missing_host_key_policy(host_key_policy)
         try:
             client.connect(
                 hostname=self.host, port=self.port, username=self.username,
@@ -152,6 +167,7 @@ class SSHSwitchClient:
                 banner_timeout=self.timeout, auth_timeout=self.timeout,
                 look_for_keys=False, allow_agent=False,
             )
+            self.trusted_host_key = host_key_policy.observed_fingerprint
             _stdin, stdout, stderr = client.exec_command(command, timeout=self.timeout)
             output = _to_text(stdout.read(MAX_COMMAND_OUTPUT + 1))
             error = _to_text(stderr.read(MAX_COMMAND_OUTPUT + 1)).strip()
