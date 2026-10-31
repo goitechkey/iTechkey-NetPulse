@@ -679,6 +679,31 @@ def init_db():
     conn.close()
 
 
+_db_schema_lock = threading.Lock()
+_db_schema_identity = None
+
+
+def _current_db_schema_identity():
+    if DB_BACKEND == "mysql":
+        return ("mysql", MYSQL_CONFIG["host"], MYSQL_CONFIG["port"],
+                MYSQL_CONFIG["database"])
+    return ("sqlite", str(DB_FILE.resolve()))
+
+
+@app.before_request
+def _ensure_database_schema():
+    """Support WSGI/Flask launches that import the app without running main."""
+    global _db_schema_identity
+    identity = _current_db_schema_identity()
+    if _db_schema_identity == identity:
+        return None
+    with _db_schema_lock:
+        if _db_schema_identity != identity:
+            init_db()
+            _db_schema_identity = identity
+    return None
+
+
 def get_setting(key, default=None):
     conn = db()
     try:
@@ -3345,8 +3370,12 @@ def ssh_creds_new():
                  datetime.now().isoformat(timespec="seconds")),
             )
             conn.commit()
-        except Exception:
-            flash("Could not save profile; check that its name is unique", "err")
+        except Exception as exc:
+            logging.exception("Could not save SSH profile")
+            if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+                flash("An SSH profile with this name already exists", "err")
+            else:
+                flash("Could not save SSH profile. Refresh the page and try again.", "err")
             return redirect(url_for("ssh_creds_new"))
         finally:
             conn.close()

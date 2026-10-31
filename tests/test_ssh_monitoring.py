@@ -241,6 +241,36 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
         self.assertEqual(listing.status_code, 200)
         self.assertNotIn("switch-secret", listing.get_data(as_text=True))
 
+    def test_wsgi_request_initializes_a_database_created_before_ssh_support(self):
+        old_db_file = monitor.DB_FILE
+        monitor.DB_FILE = Path(self.temp_dir.name) / "lazy-schema.db"
+        monitor._db_schema_identity = None
+        try:
+            client = monitor.app.test_client()
+            with client.session_transaction() as state:
+                state["user"] = "admin"
+                state["_csrf_token"] = "test-token"
+            initial = client.get("/ssh-profiles/new")
+            self.assertEqual(initial.status_code, 302)
+            monitor.set_setting("force_password_change", "0")
+            response = client.post("/ssh-profiles/new", data={
+                "_csrf_token": "test-token", "name": "New switch",
+                "profile": "cisco_ios", "username": "monitor",
+                "password": "switch-secret", "port": "22",
+            })
+            self.assertEqual(response.status_code, 302)
+            conn = monitor.db()
+            try:
+                saved = conn.execute(
+                    "SELECT name FROM ssh_credentials WHERE name = ?", ("New switch",)
+                ).fetchone()
+                self.assertIsNotNone(saved)
+            finally:
+                conn.close()
+        finally:
+            monitor.DB_FILE = old_db_file
+            monitor._db_schema_identity = None
+
     def test_device_ssh_discovery_and_bulk_sensor_creation(self):
         conn = monitor.db()
         try:
