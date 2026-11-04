@@ -246,7 +246,11 @@ CREATE TABLE IF NOT EXISTS ssh_credentials (
     profile TEXT NOT NULL DEFAULT 'cisco_ios',
     username TEXT NOT NULL,
     password TEXT,
+    auth_method TEXT NOT NULL DEFAULT 'password',
+    private_key TEXT,
+    key_passphrase TEXT,
     port INTEGER DEFAULT 22,
+    config TEXT NOT NULL DEFAULT '{}',
     host_key_sha256 TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
@@ -355,7 +359,11 @@ CREATE TABLE IF NOT EXISTS ssh_credentials (
     profile VARCHAR(32) NOT NULL DEFAULT 'cisco_ios',
     username VARCHAR(150) NOT NULL,
     password TEXT,
+    auth_method VARCHAR(16) NOT NULL DEFAULT 'password',
+    private_key TEXT,
+    key_passphrase TEXT,
     port INT DEFAULT 22,
+    config TEXT NOT NULL,
     host_key_sha256 VARCHAR(100) NOT NULL DEFAULT '',
     created_at VARCHAR(32) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -603,6 +611,10 @@ def init_db():
         _ensure_col("devices", "snmp_cred_id", "INTEGER")
         _ensure_col("devices", "ssh_cred_id", "INTEGER")
         _ensure_col("devices", "ssh_host_key_sha256", "TEXT NOT NULL DEFAULT ''")
+        _ensure_col("ssh_credentials", "auth_method", "TEXT NOT NULL DEFAULT 'password'")
+        _ensure_col("ssh_credentials", "private_key", "TEXT")
+        _ensure_col("ssh_credentials", "key_passphrase", "TEXT")
+        _ensure_col("ssh_credentials", "config", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_col("devices", "device_role", "TEXT")
         _ensure_col("sensor_data", "value_in", "REAL")
         _ensure_col("sensor_data", "value_out", "REAL")
@@ -619,6 +631,26 @@ def init_db():
             ).fetchone()
             if not column or not column["c"]:
                 conn.execute("ALTER TABLE devices ADD COLUMN " + col + " " + definition)
+        column = conn.execute(
+            "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ssh_credentials' "
+            "AND COLUMN_NAME = 'config'"
+        ).fetchone()
+        if not column or not column["c"]:
+            conn.execute("ALTER TABLE ssh_credentials ADD COLUMN config TEXT NULL")
+        for col, definition in (
+            ("auth_method", "VARCHAR(16) NOT NULL DEFAULT 'password'"),
+            ("private_key", "TEXT NULL"),
+            ("key_passphrase", "TEXT NULL"),
+        ):
+            column = conn.execute(
+                "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ssh_credentials' "
+                "AND COLUMN_NAME = ?", (col,)
+            ).fetchone()
+            if not column or not column["c"]:
+                conn.execute("ALTER TABLE ssh_credentials ADD COLUMN " + col + " " + definition)
+    conn.execute("UPDATE ssh_credentials SET config = '{}' WHERE config IS NULL OR config = ''")
 
     # Older versions stored a pin on the reusable profile. Copy it to each
     # attached device once, so profiles can now be shared safely.
@@ -928,7 +960,9 @@ def _sensor_device_ctx(sensor_row):
         return conn.execute(
             "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port, "
             "sc.profile AS ssh_profile, sc.username AS ssh_username, "
-            "sc.password AS ssh_password, sc.port AS ssh_port "
+            "sc.password AS ssh_password, sc.auth_method AS ssh_auth_method, "
+            "sc.private_key AS ssh_private_key, sc.key_passphrase AS ssh_key_passphrase, "
+            "sc.port AS ssh_port, sc.config AS ssh_config "
             "FROM devices d "
             "LEFT JOIN snmp_credentials c ON c.id = d.snmp_cred_id "
             "LEFT JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "
@@ -959,11 +993,18 @@ def _ssh_for(dev, timeout=10):
     if not dev or not dev["ssh_username"]:
         raise SSHError("Device has no SSH profile attached")
     expected_host_key = dev["ssh_host_key_sha256"] or ""
+    try:
+        profile_config = json.loads(dev["ssh_config"] or "{}")
+    except (TypeError, ValueError) as exc:
+        raise SSHError("SSH profile configuration is invalid") from exc
     return SSHSwitchClient(
         dev["host"], username=dev["ssh_username"],
         password=_decrypt_ssh_password(dev["ssh_password"]),
+        private_key=_decrypt_ssh_password(dev["ssh_private_key"]),
+        key_passphrase=_decrypt_ssh_password(dev["ssh_key_passphrase"]),
         port=dev["ssh_port"] or 22, timeout=timeout,
         profile=dev["ssh_profile"] or "cisco_ios",
+        profile_config=profile_config,
         expected_host_key=expected_host_key,
         trust_on_first_use=not bool(expected_host_key),
     )
@@ -2172,7 +2213,7 @@ HELP_HTML = """
 <aside class="card help-toc" aria-label="Help topics">
 <b style="display:block;padding:8px 10px;color:#163454">ON THIS PAGE</b>
 <a href="#start">Quick start</a><a href="#dashboard">Dashboard</a>
-<a href="#devices">Devices & groups</a><a href="#snmp">SNMP credentials</a>
+<a href="#devices">Devices & groups</a><a href="#snmp">SNMP credentials</a><a href="#ssh">SSH switch ports</a>
 <a href="#interfaces">WAN & switch ports</a><a href="#storage">Disk usage</a>
 <a href="#sensors">Sensors & history</a><a href="#traffic">Live traffic view</a>
 <a href="#alerts">Alerts & notifications</a><a href="#settings">Settings & security</a>
@@ -2200,6 +2241,10 @@ HELP_HTML = """
 <section class="card help-section" id="snmp" data-help>
 <h2>SNMP credentials</h2><p>Create credentials from the Devices page. Use a read-only SNMP community and restrict the device’s SNMP access list to the NetPulse host where practical. The current client supports <b>SNMP v1 and v2c</b> over UDP 161; SNMPv3 is not currently implemented.</p>
 <div class="help-callout">If SNMP discovery times out, verify the device address, SNMP version/community, device-side allow list, UDP 161 firewall path, and that the NetPulse host can route to the management interface.</div>
+</section>
+<section class="card help-section" id="ssh" data-help>
+<h2>SSH switch ports</h2><p>When SNMP is unavailable, add a read-only account under <a href="{{ url_for('ssh_creds_page') }}">Devices → SSH Profiles</a>, attach it to a switch, and open <b>Interfaces</b> to discover ports. The Cisco IOS/IOS XE parser is built in. For another managed switch, choose <b>Custom SSH CLI profile</b> and supply read-only commands with regex captures for port, status, traffic, and counters.</p>
+<div class="help-callout">SSH v2 on a configurable port is supported. SSHv1 is intentionally not supported because it is obsolete and insecure. The first successful connection saves the switch’s host key; a later key change is rejected until explicitly trusted again.</div>
 </section>
 <section class="card help-section" id="interfaces" data-help>
 <h2>WAN internet & switch-port traffic</h2><p>From <a href="{{ url_for('devices') }}">Devices</a>, select a router/firewall/switch and open <b>Interfaces</b>. Discovery lists SNMP interfaces; select one or more and add traffic and/or status sensors.</p>
@@ -3298,16 +3343,16 @@ SSH_CREDS_HTML = """
 <span class="spacer"></span>
 <a class="btn" href="{{ url_for('ssh_creds_new') }}">+ Add SSH Profile</a></div>
 <div class="card">{% if rows %}<table>
-<tr><th>Name</th><th>Vendor profile</th><th>Username</th><th>SSH port</th><th>Devices</th><th></th></tr>
+<tr><th>Name</th><th>Vendor profile</th><th>Username</th><th>Auth</th><th>SSH port</th><th>Devices</th><th></th></tr>
 {% for r in rows %}<tr><td><b>{{ r.name }}</b></td><td>{{ r.profile }}</td>
-<td>{{ r.username }}</td><td>{{ r.port }}</td><td>{{ r.device_count }}</td>
+<td>{{ r.username }}</td><td>{{ r.auth_method }}</td><td>{{ r.port }}</td><td>{{ r.device_count }}</td>
 <td><form method="post" action="{{ url_for('ssh_creds_delete', cid=r.id) }}"
 style="display:inline" onsubmit="return confirm('Delete this SSH profile?')">
 <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
 <button class="btn red small">Delete</button></form></td></tr>{% endfor %}</table>
 {% else %}<p>No SSH profiles configured.</p>{% endif %}
 <p style="color:#6c757d;font-size:12px;margin-top:12px">
-Enter only the SSH username and password. On the first successful connection, the switch key is trusted and saved for that device; later connections verify it. Passwords are not shown after saving.</p></div>
+Use password or private-key authentication with a read-only account. On the first successful connection, the switch key is trusted and saved for that device; later connections verify it. Secrets are not shown after saving.</p></div>
 """
 
 
@@ -3317,7 +3362,7 @@ def ssh_creds_page():
     conn = db()
     try:
         rows = conn.execute(
-            "SELECT c.id, c.name, c.profile, c.username, c.port, "
+            "SELECT c.id, c.name, c.profile, c.username, c.auth_method, c.port, "
             "(SELECT COUNT(*) FROM devices WHERE ssh_cred_id = c.id) AS device_count "
             "FROM ssh_credentials c ORDER BY c.name"
         ).fetchall()
@@ -3335,11 +3380,38 @@ SSH_CRED_FORM_HTML = """
 {% for profile in profiles %}<option value="{{ profile }}">{{ profile }}</option>{% endfor %}
 </select></div><div><label>SSH port</label><input type="number" name="port" value="22" min="1" max="65535"></div></div>
 <div class="row"><div><label>Username</label><input name="username" required autocomplete="off"></div>
-<div><label>Password</label><input type="password" name="password" required autocomplete="new-password"></div></div>
-<p style="font-size:12px;color:#6c757d">Use a read-only switch account. After attaching this profile to a device, open that device's Interfaces page to connect and trust its SSH key automatically. Credentials are stored in the application database; restrict database and backup access.</p>
+<div><label>Authentication</label><select name="auth_method" id="authMethod"><option value="password">Password</option><option value="private_key">Private key</option></select></div></div>
+<div class="row" id="passwordAuth"><div><label>Password</label><input type="password" name="password" autocomplete="new-password"></div></div>
+<div id="keyAuth" style="display:none"><div class="row"><div style="flex:2"><label>Private key</label><textarea name="private_key" rows="5" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
+<div><label>Key passphrase (optional)</label><input type="password" name="key_passphrase" autocomplete="new-password"></div></div></div>
+<div id="customCliConfig" style="display:none">
+<h2 style="margin:14px 0 8px">Custom SSH CLI parser</h2>
+<p style="font-size:12px;color:#5b6b7b">Use this profile when your switch is not listed. Commands must be read-only and use <code>{port}</code> in the per-port command. Regex fields need a named capture such as <code>(?P&lt;port&gt;...)</code>, <code>(?P&lt;status&gt;...)</code>, or <code>(?P&lt;value&gt;...)</code>.</p>
+<div class="row"><div><label>Port discovery command</label><input name="discovery_command" value="{{ custom.discovery_command }}" placeholder="show interfaces status"></div>
+<div><label>Per-port command</label><input name="port_command" value="{{ custom.port_command }}" placeholder="show interfaces {port}"></div></div>
+<div class="row"><div style="flex:2"><label>Port discovery regex</label><textarea name="port_regex" rows="3" placeholder="(?m)^(?P&lt;port&gt;\\S+)\\s+(?P&lt;status&gt;up|down)">{{ custom.port_regex }}</textarea></div>
+<div><label>Up values (comma-separated)</label><input name="up_values" value="{{ custom.up_values }}" placeholder="up,connected"></div></div>
+<div class="row"><div><label>Port status regex</label><input name="status_regex" value="{{ custom.status_regex }}" placeholder="Status:\\s*(?P&lt;status&gt;up|down)"></div>
+<div><label>Rate unit</label><select name="rate_unit"><option value="bps" {{ 'selected' if custom.rate_unit == 'bps' }}>bits/sec</option><option value="kbps" {{ 'selected' if custom.rate_unit == 'kbps' }}>Kbps</option><option value="mbps" {{ 'selected' if custom.rate_unit == 'mbps' }}>Mbps</option></select></div></div>
+<div class="row"><div><label>Input rate regex (optional)</label><input name="input_rate_regex" value="{{ custom.input_rate_regex }}"></div>
+<div><label>Output rate regex (optional)</label><input name="output_rate_regex" value="{{ custom.output_rate_regex }}"></div></div>
+<div class="row"><div><label>Input errors regex (optional)</label><input name="input_errors_regex" value="{{ custom.input_errors_regex }}"></div>
+<div><label>Output errors regex (optional)</label><input name="output_errors_regex" value="{{ custom.output_errors_regex }}"></div>
+<div><label>CRC errors regex (optional)</label><input name="crc_errors_regex" value="{{ custom.crc_errors_regex }}"></div></div>
+</div>
+<p style="font-size:12px;color:#6c757d">Use a read-only switch account. After attaching this profile to a device, open that device's Interfaces page to connect and trust its SSH key automatically. Passwords, private keys, and passphrases are encrypted in the application database; restrict database and backup access.</p>
 <button class="btn">Save profile</button>
 <a class="btn grey" href="{{ url_for('ssh_creds_page') }}">Cancel</a>
 </div></form>
+<script>
+const profileSelect=document.querySelector('[name="profile"]');
+const customConfig=document.getElementById('customCliConfig');
+function toggleCustomConfig(){customConfig.style.display=profileSelect.value==='custom_cli'?'block':'none';}
+profileSelect.addEventListener('change',toggleCustomConfig);toggleCustomConfig();
+const authMethod=document.getElementById('authMethod');
+function toggleAuth(){const key=authMethod.value==='private_key';document.getElementById('passwordAuth').style.display=key?'none':'block';document.getElementById('keyAuth').style.display=key?'block':'none';}
+authMethod.addEventListener('change',toggleAuth);toggleAuth();
+</script>
 """
 
 
@@ -3347,27 +3419,71 @@ SSH_CRED_FORM_HTML = """
 @login_required
 def ssh_creds_new():
     profiles = sorted(SSH_PROFILE_REGISTRY)
+    custom = {
+        "discovery_command": "show interfaces status",
+        "port_command": "show interfaces {port}",
+        "port_regex": "", "status_regex": "", "up_values": "up,connected",
+        "rate_unit": "bps", "input_rate_regex": "", "output_rate_regex": "",
+        "input_errors_regex": "", "output_errors_regex": "", "crc_errors_regex": "",
+    }
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         profile = request.form.get("profile", "").strip()
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        auth_method = request.form.get("auth_method", "password")
+        private_key = request.form.get("private_key", "").strip()
+        key_passphrase = request.form.get("key_passphrase", "")
         try:
             port = int(request.form.get("port") or 22)
         except ValueError:
             port = 0
-        if (not name or not username or not password or profile not in SSH_PROFILE_REGISTRY
+        has_authentication = password if auth_method == "password" else private_key
+        if (not name or not username or not has_authentication or auth_method not in ("password", "private_key")
+                or profile not in SSH_PROFILE_REGISTRY
                 or not 1 <= port <= 65535):
-            flash("Check the profile name, username, password, supported parser, and SSH port", "err")
+            flash("Check the profile name, username, authentication, supported parser, and SSH port", "err")
             return redirect(url_for("ssh_creds_new"))
+        profile_config = {}
+        if profile == "custom_cli":
+            for key in custom:
+                profile_config[key] = request.form.get(key, "").strip()
+            profile_config["rate_unit"] = request.form.get("rate_unit", "bps").lower()
+            required = ("discovery_command", "port_command", "port_regex", "status_regex")
+            if any(not profile_config[key] for key in required):
+                flash("Custom profile needs discovery command, port command, port regex, and status regex", "err")
+                return redirect(url_for("ssh_creds_new"))
+            if ("{port}" not in profile_config["port_command"]
+                    or not re.match(r"^\s*(show|display|get|status)\b", profile_config["discovery_command"], re.I)
+                    or not re.match(r"^\s*(show|display|get|status)\b", profile_config["port_command"], re.I)
+                    or any(token in profile_config["discovery_command"] or token in profile_config["port_command"]
+                           for token in (";", "\n", "\r", "|", "&", "`", "$"))
+                    or "?P<port>" not in profile_config["port_regex"]):
+                flash("Use read-only commands, include {port}, and capture the port as (?P<port>...)", "err")
+                return redirect(url_for("ssh_creds_new"))
+            try:
+                for key in ("port_regex", "status_regex", "input_rate_regex", "output_rate_regex",
+                            "input_errors_regex", "output_errors_regex", "crc_errors_regex"):
+                    if profile_config[key]:
+                        re.compile(profile_config[key])
+            except re.error:
+                flash("One or more custom parser regex fields are invalid", "err")
+                return redirect(url_for("ssh_creds_new"))
+            if profile_config["rate_unit"] not in ("bps", "kbps", "mbps"):
+                flash("Invalid custom rate unit", "err")
+                return redirect(url_for("ssh_creds_new"))
         conn = db()
         try:
             conn.execute(
                 "INSERT INTO ssh_credentials "
-                "(name, profile, username, password, port, host_key_sha256, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, profile, username, _encrypt_ssh_password(password), port, "",
-                 datetime.now().isoformat(timespec="seconds")),
+                "(name, profile, username, password, auth_method, private_key, key_passphrase, "
+                "port, config, host_key_sha256, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (name, profile, username,
+                 _encrypt_ssh_password(password) if password else "", auth_method,
+                 _encrypt_ssh_password(private_key) if private_key else "",
+                 _encrypt_ssh_password(key_passphrase) if key_passphrase else "", port,
+                 json.dumps(profile_config), "", datetime.now().isoformat(timespec="seconds")),
             )
             conn.commit()
         except Exception as exc:
@@ -3381,7 +3497,7 @@ def ssh_creds_new():
             conn.close()
         return _flash_redirect(url_for("ssh_creds_page"), "SSH profile added")
     body = render_template_string(
-        SSH_CRED_FORM_HTML, profiles=profiles, url_for=url_for,
+        SSH_CRED_FORM_HTML, profiles=profiles, custom=custom, url_for=url_for,
     )
     return render_ctx(body, "New SSH profile", "devices")
 
@@ -3513,7 +3629,9 @@ def device_interfaces(did):
         dev = conn.execute(
             "SELECT d.*, c.community, c.version AS snmp_ver, c.port AS snmp_port, "
             "sc.profile AS ssh_profile, sc.username AS ssh_username, "
-            "sc.password AS ssh_password, sc.port AS ssh_port "
+            "sc.password AS ssh_password, sc.auth_method AS ssh_auth_method, "
+            "sc.private_key AS ssh_private_key, sc.key_passphrase AS ssh_key_passphrase, "
+            "sc.port AS ssh_port, sc.config AS ssh_config "
             "FROM devices d "
             "LEFT JOIN snmp_credentials c ON c.id = d.snmp_cred_id "
             "LEFT JOIN ssh_credentials sc ON sc.id = d.ssh_cred_id "

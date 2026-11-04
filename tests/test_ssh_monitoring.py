@@ -8,6 +8,7 @@ from unittest import mock
 
 import itechkey_monitor as monitor
 from itechkey_ssh import (
+    CustomCLIProfile,
     SSHError,
     SSH_PROFILE_REGISTRY,
     _ExpectedHostKeyPolicy,
@@ -79,6 +80,40 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
             self.assertIn("test_vendor", SSH_PROFILE_REGISTRY)
         finally:
             del SSH_PROFILE_REGISTRY["test_vendor"]
+
+    def test_custom_cli_profile_parses_configured_switch_output(self):
+        profile = CustomCLIProfile({
+            "discovery_command": "show ports",
+            "port_command": "show port {port}",
+            "port_regex": r"^(?P<port>Eth\d+)\s+(?P<status>up|down)\s+(?P<speed>\d+)$",
+            "status_regex": r"State:\s*(?P<status>up|down)",
+            "input_rate_regex": r"RX:\s*(?P<value>\d+)",
+            "output_rate_regex": r"TX:\s*(?P<value>\d+)",
+            "input_errors_regex": r"RX errors:\s*(?P<value>\d+)",
+            "output_errors_regex": r"TX errors:\s*(?P<value>\d+)",
+            "crc_errors_regex": r"CRC:\s*(?P<value>\d+)",
+            "rate_unit": "bps", "up_values": "up,connected",
+        })
+        ports = profile.parse_ports("Eth1 up 1000\nEth2 down 1000")
+        self.assertEqual(ports[0]["port"], "Eth1")
+        self.assertEqual(ports[1]["oper_status"], "down")
+
+        details = profile.parse_details("Eth1", """State: up
+RX: 2500000
+TX: 1250000
+RX errors: 3
+TX errors: 1
+CRC: 2""")
+        self.assertEqual(details["oper_status"], "up")
+        self.assertEqual(details["in_mbps"], 2.5)
+        self.assertEqual(details["output_errors"], 1)
+
+    def test_custom_cli_profile_rejects_non_read_only_commands(self):
+        with self.assertRaises(SSHError):
+            CustomCLIProfile({
+                "discovery_command": "show ports; reload",
+                "port_command": "show port {port}",
+            })
 
     def test_ssh_traffic_check_returns_separate_rates(self):
         sensor = {
@@ -240,6 +275,63 @@ Gi1/0/2                        notconnect   1          auto    auto   10/100/100
         listing = client.get("/ssh-profiles")
         self.assertEqual(listing.status_code, 200)
         self.assertNotIn("switch-secret", listing.get_data(as_text=True))
+
+    def test_custom_ssh_profile_form_saves_parser_configuration(self):
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+            state["_csrf_token"] = "test-token"
+        response = client.post("/ssh-profiles/new", data={
+            "_csrf_token": "test-token", "name": "Generic switch",
+            "profile": "custom_cli", "username": "monitor",
+            "password": "switch-secret", "port": "2222",
+            "discovery_command": "show ports",
+            "port_command": "show port {port}",
+            "port_regex": r"^(?P<port>Eth\d+)\s+(?P<status>up|down)$",
+            "status_regex": r"State:\s*(?P<status>up|down)",
+            "up_values": "up,connected", "rate_unit": "bps",
+            "input_rate_regex": r"RX:\s*(?P<value>\d+)",
+            "output_rate_regex": r"TX:\s*(?P<value>\d+)",
+            "input_errors_regex": "", "output_errors_regex": "", "crc_errors_regex": "",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = monitor.db()
+        try:
+            row = conn.execute(
+                "SELECT config, port FROM ssh_credentials WHERE name = ?", ("Generic switch",)
+            ).fetchone()
+            self.assertEqual(row["port"], 2222)
+            self.assertEqual(json.loads(row["config"])["port_command"], "show port {port}")
+        finally:
+            conn.close()
+
+    def test_private_key_profile_secrets_are_encrypted(self):
+        monitor.set_setting("force_password_change", "0")
+        client = monitor.app.test_client()
+        private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nexample\n-----END OPENSSH PRIVATE KEY-----"
+        with client.session_transaction() as state:
+            state["user"] = "admin"
+            state["_csrf_token"] = "test-token"
+        response = client.post("/ssh-profiles/new", data={
+            "_csrf_token": "test-token", "name": "Key switch",
+            "profile": "cisco_ios", "username": "monitor", "port": "22",
+            "auth_method": "private_key", "password": "", "private_key": private_key,
+            "key_passphrase": "key-passphrase",
+        })
+        self.assertEqual(response.status_code, 302)
+        conn = monitor.db()
+        try:
+            row = conn.execute(
+                "SELECT auth_method, private_key, key_passphrase FROM ssh_credentials "
+                "WHERE name = ?", ("Key switch",)
+            ).fetchone()
+            self.assertEqual(row["auth_method"], "private_key")
+            self.assertNotIn("example", row["private_key"])
+            self.assertEqual(monitor._decrypt_ssh_password(row["private_key"]), private_key)
+            self.assertEqual(monitor._decrypt_ssh_password(row["key_passphrase"]), "key-passphrase")
+        finally:
+            conn.close()
 
     def test_wsgi_request_initializes_a_database_created_before_ssh_support(self):
         old_db_file = monitor.DB_FILE
