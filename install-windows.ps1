@@ -67,6 +67,7 @@ $RequiredFiles = @(
     "itechkey_collector.py",
     "itechkey_snmp.py",
     "itechkey_ssh.py",
+    "restart-netpulse.ps1",
     "itechkey_setup.py",
     "requirements.txt"
 )

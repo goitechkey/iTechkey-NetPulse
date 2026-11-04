@@ -46,6 +46,8 @@ Run **iTechkey-Setup.exe as Administrator** (approve the UAC prompt). The Window
 
 In elevated PowerShell, use `Get-ScheduledTask -TaskName 'iTechkey NetPulse Monitor'` to check it, `Stop-ScheduledTask -TaskName 'iTechkey NetPulse Monitor'` to stop it, or `Start-ScheduledTask -TaskName 'iTechkey NetPulse Monitor'` to start it again. Re-running the installer updates the existing task.
 
+After an upgrade, run PowerShell as Administrator and execute `./restart-netpulse.ps1`. It applies database schema updates before restarting the NetPulse task. MySQL itself does not normally need a restart for an application upgrade. If the database administrator requires one, use `./restart-netpulse.ps1 -DatabaseServiceName 'MySQL80'` with that server's actual Windows service name.
+
 ## Architecture (1000+ sensors)
 
 - **MySQL 8** with InnoDB (or SQLite for small setups)
